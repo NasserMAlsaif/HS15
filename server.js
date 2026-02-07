@@ -436,6 +436,7 @@ function updateProjectiles(roomCode, dt) {
                     victimId: player.id,
                     ownerId: proj.ownerId
                 });
+                console.log('[srv] hitEffect', roomCode, hitType, 'headshot=', headshot, 'owner=', proj.ownerId, 'victim=', player.id);
                 
                 // Handle damage (shield blocks exactly one hit, even headshots)
                 if (blockedByShield) {
@@ -593,6 +594,7 @@ function checkBuffPickup(roomCode, playerId) {
                 buffId: buff.id,
                 buffType: buff.type
             });
+            console.log('[srv] buffPickup', roomCode, buff.type, playerId);
         }
     });
 }
@@ -941,6 +943,7 @@ io.on('connection', (socket) => {
         rooms[currentRoom].projectiles.push(projectile);
         
         io.to(currentRoom).emit('projectileFired', projectile);
+        console.log('[srv] projectileFired', currentRoom, socket.id);
     });
 
     socket.on('leaveRoom', () => {
