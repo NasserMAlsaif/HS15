@@ -6,6 +6,7 @@ const express = require('express');
 const http = require('http');
 const socketIO = require('socket.io');
 const path = require('path');
+const crypto = require('crypto');
 
 const app = express();
 const server = http.createServer(app);
@@ -31,6 +32,11 @@ const PLAYER_RESPAWN_DELAY = 3000;
 const BUFF_RESPAWN_DELAY = 6000;
 const KILL_CHAIN_WINDOW = 6000;
 const COUNTDOWN_DURATION = 3000;
+const MIN_SHOT_INTERVAL_MS = 140; // server-side fire rate cap
+const MAX_ACTIVE_PROJECTILES_PER_PLAYER = 8;
+const MAX_INPUT_AHEAD_SEQ = 200;
+const SESSION_TTL_MS = 1000 * 60 * 60 * 24 * 14; // 14 days
+const SESSION_SECRET = process.env.SESSION_SECRET || 'headshooter-dev-secret-change-me';
 
 const KILLSTREAK_TIERS = {
     EXTRA_CORE: 3,
@@ -180,14 +186,90 @@ const BUFF_TYPES = ['health', 'shield', 'invis', 'speed'];
 
 // ==================== ROOM MANAGEMENT ====================
 const rooms = {};
-function emitLobbyUpdate(roomCode) {
+const sessions = {}; // persistentId -> { token, name, exp }
+
+function toBase64Url(str) {
+    return Buffer.from(str, 'utf8').toString('base64url');
+}
+
+function fromBase64Url(b64) {
+    return Buffer.from(b64, 'base64url').toString('utf8');
+}
+
+function signSessionPayload(payloadB64) {
+    return crypto.createHmac('sha256', SESSION_SECRET).update(payloadB64).digest('base64url');
+}
+
+function issueSessionToken(persistentId, name) {
+    const payload = {
+        pid: persistentId,
+        name: name || 'Player',
+        exp: Date.now() + SESSION_TTL_MS,
+        nonce: crypto.randomBytes(12).toString('hex')
+    };
+    const payloadB64 = toBase64Url(JSON.stringify(payload));
+    const sig = signSessionPayload(payloadB64);
+    return `${payloadB64}.${sig}`;
+}
+
+function verifySessionToken(token, persistentId) {
+    if (!token || typeof token !== 'string') return null;
+    const parts = token.split('.');
+    if (parts.length !== 2) return null;
+    const payloadB64 = parts[0];
+    const givenSig = parts[1];
+    const expectedSig = signSessionPayload(payloadB64);
+    const a = Buffer.from(givenSig);
+    const b = Buffer.from(expectedSig);
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+    let payload;
+    try {
+        payload = JSON.parse(fromBase64Url(payloadB64));
+    } catch (e) {
+        return null;
+    }
+    if (!payload || payload.pid !== persistentId) return null;
+    if (!payload.exp || Date.now() > payload.exp) return null;
+    return payload;
+}
+function emitLobbyUpdate(roomCode, targetSocket = null) {
     const room = rooms[roomCode];
     if (!room) return;
-    io.to(roomCode).emit('lobbyUpdate', {
+    const payload = {
         roomCode: room.code,
         leaderId: room.leader,
         players: room.players,
         state: room.state
+    };
+    if (targetSocket) {
+        targetSocket.emit('lobbyUpdate', payload);
+        return;
+    }
+    io.to(roomCode).emit('lobbyUpdate', payload);
+}
+
+function resetRoomForLobby(roomCode) {
+    const room = rooms[roomCode];
+    if (!room) return;
+    room.state = 'lobby';
+    room.gameStartTime = null;
+    room.projectiles = [];
+    room.killChains = {};
+    room.nextSpawnIndex = 0;
+    Object.entries(room.players).forEach(([key, p]) => {
+        p.ready = (key === room.leader);
+        p.charging = false;
+        p.lastShotAt = 0;
+        p.inputSeq = 0;
+        p.input = {
+            w: false,
+            a: false,
+            s: false,
+            d: false,
+            angle: p.angle || 0,
+            charging: false,
+            seq: 0
+        };
     });
 }
 
@@ -196,7 +278,7 @@ function generateRoomCode() {
     return rooms[code] ? generateRoomCode() : code;
 }
 
-function createRoom(leaderId, leaderName) {
+function createRoom(leaderId, leaderName, leaderPersistentId) {
     const code = generateRoomCode();
     rooms[code] = {
         code: code,
@@ -213,25 +295,7 @@ function createRoom(leaderId, leaderName) {
     };
     
     // Add leader
-    rooms[code].players[leaderId] = {
-        id: leaderId,
-        name: leaderName,
-        ready: true,  // Leader is auto-ready
-        x: 0,
-        y: 0,
-        angle: 0,
-        hp: 3,
-        maxHp: 3,
-        kills: 0,
-        deaths: 0,
-        killstreak: 0,
-        hasShield: false,
-        invisible: false,
-        speedBoost: false,
-        charging: false,
-        input: { w: false, a: false, s: false, d: false, angle: 0, charging: false, seq: 0 },
-        lastUpdate: Date.now()
-    };
+    rooms[code].players[leaderId] = makePlayer(leaderId, leaderName, leaderPersistentId, true);
     
     return code;
 }
@@ -352,6 +416,10 @@ function updatePlayers(roomCode, dt) {
         if (player.hasShield && player.shieldExpire && now > player.shieldExpire) player.hasShield = false;
         if (player.invisible && player.invisExpire && now > player.invisExpire) player.invisible = false;
         if (player.speedBoost && player.speedExpire && now > player.speedExpire) player.speedBoost = false;
+
+        // Keep disconnected players in the world, but do not process movement/input.
+        // Timed buffs above must still expire while disconnected.
+        if (player.disconnected) return;
 
         const input = player.input || { w:false,a:false,s:false,d:false,angle:player.angle,charging:false };
 
@@ -599,80 +667,259 @@ function checkBuffPickup(roomCode, playerId) {
     });
 }
 
+function makePlayer(socketId, playerName, persistentId, isLeader) {
+    return {
+        id: socketId,
+        persistentId: persistentId || null,
+        name: playerName || 'Player',
+        ready: !!isLeader,
+        disconnected: false,
+        x: 0,
+        y: 0,
+        angle: 0,
+        hp: 3,
+        maxHp: 3,
+        kills: 0,
+        deaths: 0,
+        killstreak: 0,
+        hasShield: false,
+        invisible: false,
+        speedBoost: false,
+        charging: false,
+        lastShotAt: 0,
+        inputSeq: 0,
+        antiCheatStrikes: 0,
+        input: { w: false, a: false, s: false, d: false, angle: 0, charging: false, seq: 0 },
+        lastUpdate: Date.now()
+    };
+}
+
+function findPlayerEntryByPersistentId(room, persistentId) {
+    if (!room || !persistentId) return null;
+    const entry = Object.entries(room.players).find(([, p]) => p && p.persistentId === persistentId);
+    return entry || null;
+}
+
 // ==================== SOCKET.IO EVENTS ====================
 io.on('connection', (socket) => {
     console.log(`Player connected: ${socket.id}`);
     
     let currentRoom = null;
     let heartbeatInterval = null;
+    socket.playerKey = socket.id;
+    socket.authPersistentId = null;
+    socket.authenticated = false;
+    socket.rateLimits = {};
     
     // Heartbeat
     heartbeatInterval = setInterval(() => {
         socket.emit('heartbeat');
     }, 5000);
 
-    function removePlayerFromRoom() {
+    function getPlayer(room) {
+        if (!room) return null;
+        const key = socket.playerKey || socket.id;
+        return room.players[key] || null;
+    }
+
+    function allowEvent(eventName, maxCount, windowMs) {
+        const now = Date.now();
+        const rl = socket.rateLimits[eventName] || { count: 0, start: now };
+        if (now - rl.start > windowMs) {
+            rl.count = 0;
+            rl.start = now;
+        }
+        rl.count += 1;
+        socket.rateLimits[eventName] = rl;
+        return rl.count <= maxCount;
+    }
+
+    function resolveRoomForSocket(data) {
+        const requestedRoomCode = data && typeof data.roomCode === 'string' ? data.roomCode : '';
+        let roomCode = socket.roomCode || null;
+
+        if (requestedRoomCode && rooms[requestedRoomCode]) {
+            roomCode = requestedRoomCode;
+        }
+
+        if ((!roomCode || !rooms[roomCode]) && socket.authPersistentId) {
+            const found = Object.entries(rooms).find(([, room]) => {
+                return Object.values(room.players || {}).some(p => p && p.persistentId === socket.authPersistentId);
+            });
+            if (found) roomCode = found[0];
+        }
+
+        const room = roomCode ? rooms[roomCode] : null;
+        if (!room) return null;
+
+        socket.roomCode = roomCode;
+        if (!socket.playerKey || !room.players[socket.playerKey]) {
+            const keyBySocket = room.players[socket.id] ? socket.id : null;
+            if (keyBySocket) {
+                socket.playerKey = keyBySocket;
+            } else if (socket.authPersistentId) {
+                const entry = findPlayerEntryByPersistentId(room, socket.authPersistentId);
+                if (entry) socket.playerKey = entry[0];
+            }
+        }
+        return { roomCode, room };
+    }
+
+    function removePlayerFromRoom(options = {}) {
+        const { preserveInMatch = false } = options;
         const roomCode = socket.roomCode;
         if (!roomCode || !rooms[roomCode]) return;
 
         const room = rooms[roomCode];
-        const disconnectedPlayer = room.players[socket.id];
+        const key = socket.playerKey || socket.id;
+        const player = room.players[key];
+        if (!player) return;
 
-        if (disconnectedPlayer) {
-            console.log(`Player ${disconnectedPlayer.name} left room ${roomCode}`);
+        const inMatch = room.state === 'playing' || room.state === 'starting' || room.state === 'countdown';
+        if (preserveInMatch && inMatch) {
+            player.disconnected = true;
+            player.input = { w: false, a: false, s: false, d: false, angle: player.angle || 0, charging: false, seq: 0 };
+            socket.leave(roomCode);
+            console.log(`Player ${player.name} disconnected (preserved) in room ${roomCode}`);
+
+            if (room.leader === key) {
+                const connectedPlayers = Object.values(room.players).filter(p => !p.disconnected);
+                const fallback = connectedPlayers[0] || Object.values(room.players)[0];
+                if (fallback) {
+                    const newLeaderKey = Object.keys(room.players).find(k => room.players[k] === fallback) || fallback.id;
+                    room.leader = newLeaderKey;
+                    fallback.ready = true;
+                    io.to(roomCode).emit('newLeader', { leaderId: room.leader, leaderName: fallback.name });
+                }
+            }
+            return;
         }
 
-        delete room.players[socket.id];
+        console.log(`Player ${player.name} left room ${roomCode}`);
+        delete room.players[key];
+        socket.leave(roomCode);
 
         const remainingPlayers = Object.values(room.players);
-
         if (remainingPlayers.length === 0) {
             delete rooms[roomCode];
             console.log(`Room ${roomCode} deleted (empty)`);
             return;
         }
 
-        if (room.leader === socket.id) {
+        if (room.leader === key) {
             const newLeader = remainingPlayers[0];
-            room.leader = newLeader.id;
+            const newLeaderKey = Object.keys(room.players).find(k => room.players[k] === newLeader) || newLeader.id;
+            room.leader = newLeaderKey;
             newLeader.ready = true;
-
             console.log(`New leader: ${newLeader.name}`);
-            io.to(roomCode).emit('newLeader', {
-                leaderId: newLeader.id,
-                leaderName: newLeader.name
-            });
+            io.to(roomCode).emit('newLeader', { leaderId: room.leader, leaderName: newLeader.name });
         }
 
         emitLobbyUpdate(roomCode);
-
         io.to(roomCode).emit('playerLeft', {
-            playerId: socket.id,
-            playerName: disconnectedPlayer ? disconnectedPlayer.name : 'Unknown'
+            playerId: key,
+            playerName: player ? player.name : 'Unknown'
         });
     }
     
     // داخل io.on('connection', ...) في ملف server.js
     socket.on('registerPlayer', (data) => {
-        socket.persistentId = data.id;
-        socket.playerName = data.name;
-        console.log(`Player recognized: ${data.name} with ID: ${data.id}`);
+        if (!allowEvent('registerPlayer', 12, 10000)) return;
+        const incomingId = (data && typeof data.id === 'string') ? data.id.trim() : '';
+        const incomingName = (data && typeof data.name === 'string') ? data.name.trim() : 'Player';
+        const incomingToken = data && typeof data.token === 'string' ? data.token : '';
+        if (!incomingId || incomingId.length < 6 || incomingId.length > 64) {
+            socket.emit('authError', { message: 'Invalid player identity.' });
+            return;
+        }
+
+        socket.persistentId = incomingId;
+        socket.playerName = incomingName || 'Player';
+
+        const tokenPayload = verifySessionToken(incomingToken, incomingId);
+        if (tokenPayload) {
+            socket.authenticated = true;
+            socket.authPersistentId = incomingId;
+        } else {
+            socket.authenticated = true; // first-time bootstrap from this device
+            socket.authPersistentId = incomingId;
+        }
+
+        const newToken = issueSessionToken(incomingId, socket.playerName);
+        sessions[incomingId] = { token: newToken, name: socket.playerName, exp: Date.now() + SESSION_TTL_MS };
+        socket.emit('sessionToken', { token: newToken, exp: sessions[incomingId].exp });
+        console.log(`Player recognized: ${socket.playerName} with ID: ${incomingId}`);
+
+        // Auto-reconnect to an active match by persistent ID
+        if (!socket.authPersistentId) return;
+        for (const [roomCode, room] of Object.entries(rooms)) {
+            if (!room || room.state !== 'playing') continue;
+            const entry = findPlayerEntryByPersistentId(room, socket.authPersistentId);
+            if (!entry) continue;
+
+            const [oldKey, player] = entry;
+            if (!player.disconnected) continue;
+
+            delete room.players[oldKey];
+            player.id = socket.id;
+            player.name = socket.playerName || player.name;
+            player.disconnected = false;
+            player.lastUpdate = Date.now();
+            // Reconnect can restart client input sequence from 0.
+            // Reset server-side input state to prevent anti-cheat false rejects.
+            player.inputSeq = 0;
+            player.lastShotAt = 0;
+            player.input = {
+                w: false,
+                a: false,
+                s: false,
+                d: false,
+                angle: player.angle || 0,
+                charging: false,
+                seq: 0
+            };
+            room.players[socket.id] = player;
+
+            if (room.leader === oldKey) room.leader = socket.id;
+
+            socket.playerKey = socket.id;
+            socket.roomCode = roomCode;
+            currentRoom = roomCode;
+            socket.join(roomCode);
+
+            socket.emit('reconnectedToGame', {
+                roomCode,
+                mapKey: room.selectedMap || room.map || 'forest',
+                players: room.players,
+                startTime: room.gameStartTime || Date.now()
+            });
+            console.log(`Player ${player.name} reconnected to room ${roomCode}`);
+            break;
+        }
     });
 
     socket.on('pong', () => {
-        if (currentRoom && rooms[currentRoom] && rooms[currentRoom].players[socket.id]) {
-            rooms[currentRoom].players[socket.id].lastUpdate = Date.now();
+        if (currentRoom && rooms[currentRoom]) {
+            const player = getPlayer(rooms[currentRoom]);
+            if (player) player.lastUpdate = Date.now();
         }
     });
     
     // Create room
     socket.on('createRoom', (data) => {
+    if (!allowEvent('createRoom', 4, 10000)) return;
+    if (!socket.authenticated || !socket.authPersistentId) {
+        socket.emit('authError', { message: 'Please re-authenticate.' });
+        return;
+    }
     // إنشاء الغرفة باستخدام الاسم القادم من المتصفح
-        const code = createRoom(socket.id, data.playerName || 'Soldier');
+        const persistentId = socket.authPersistentId;
+        const code = createRoom(socket.id, data.playerName || 'Soldier', persistentId);
         currentRoom = code;
         socket.join(code);
 
         socket.roomCode = code;
+        socket.playerKey = socket.id;
         
         // إرسال الرد للمتصفح (تأكدنا من تسمية roomCode لتطابق الكلاينت)
         socket.emit('roomCreated', {
@@ -689,15 +936,64 @@ io.on('connection', (socket) => {
     
     // Join room
     socket.on('joinRoom', (data) => {
+        if (!allowEvent('joinRoom', 6, 10000)) return;
+        if (!socket.authenticated || !socket.authPersistentId) {
+            socket.emit('authError', { message: 'Please re-authenticate.' });
+            return;
+        }
         const code = data.roomCode;
         const room = rooms[code];
+        const persistentId = socket.authPersistentId;
         
         if (!room) {
             socket.emit('joinError', { message: 'Room not found' });
             return;
         }
-        
+
         if (room.state !== 'lobby') {
+            // Allow reconnect while the match is active
+            if ((room.state === 'playing' || room.state === 'starting' || room.state === 'countdown') && persistentId) {
+                const entry = findPlayerEntryByPersistentId(room, persistentId);
+                if (entry) {
+                    const [oldKey, player] = entry;
+                    if (player.disconnected) {
+                        delete room.players[oldKey];
+                        player.id = socket.id;
+                        player.name = data.playerName || player.name;
+                        player.disconnected = false;
+                        player.lastUpdate = Date.now();
+                        // Reconnect can restart client input sequence from 0.
+                        // Reset server-side input state to prevent anti-cheat false rejects.
+                        player.inputSeq = 0;
+                        player.lastShotAt = 0;
+                        player.input = {
+                            w: false,
+                            a: false,
+                            s: false,
+                            d: false,
+                            angle: player.angle || 0,
+                            charging: false,
+                            seq: 0
+                        };
+                        room.players[socket.id] = player;
+                        if (room.leader === oldKey) room.leader = socket.id;
+
+                        currentRoom = code;
+                        socket.join(code);
+                        socket.roomCode = code;
+                        socket.playerKey = socket.id;
+
+                        socket.emit('reconnectedToGame', {
+                            roomCode: code,
+                            mapKey: room.selectedMap || room.map || 'forest',
+                            players: room.players,
+                            startTime: room.gameStartTime || Date.now()
+                        });
+                        console.log(`Player ${player.name} rejoined active room ${code}`);
+                        return;
+                    }
+                }
+            }
             socket.emit('joinError', { message: 'Game already started' });
             return;
         }
@@ -712,26 +1008,9 @@ io.on('connection', (socket) => {
         socket.join(code);
 
         socket.roomCode = code;
+        socket.playerKey = socket.id;
         
-        room.players[socket.id] = {
-            id: socket.id,
-            name: data.playerName || 'Player',
-            ready: false,
-            x: 0,
-            y: 0,
-            angle: 0,
-            hp: 3,
-            maxHp: 3,
-            kills: 0,
-            deaths: 0,
-            killstreak: 0,
-            hasShield: false,
-            invisible: false,
-            speedBoost: false,
-            charging: false,
-            input: { w: false, a: false, s: false, d: false, angle: 0, charging: false, seq: 0 },
-            lastUpdate: Date.now()
-        };
+        room.players[socket.id] = makePlayer(socket.id, data.playerName || 'Player', persistentId, false);
         
         io.to(code).emit('playerJoined', {
             roomCode: code,
@@ -745,19 +1024,20 @@ io.on('connection', (socket) => {
     });
     
     socket.on('playerReady', () => {
+        if (!allowEvent('playerReady', 20, 10000)) return;
         // استخدم socket.roomCode بدلاً من البحث
         const roomCode = socket.roomCode;
         const room = rooms[roomCode];
         
-        if (!room || !room.players[socket.id]) {
+        const player = getPlayer(room);
+        if (!room || !player) {
             console.log('Player not in any room');
             return;
         }
-        
-        const player = room.players[socket.id];
+
         
         // لا تسمح للقائد بتغيير ready status
-        if (room.leader === socket.id) {
+        if (room.leader === (socket.playerKey || socket.id)) {
             console.log('Leader is always ready');
             return;
         }
@@ -779,9 +1059,10 @@ io.on('connection', (socket) => {
 
     // Toggle ready
     socket.on('toggleReady', () => {
+        if (!allowEvent('toggleReady', 20, 10000)) return;
         if (!currentRoom || !rooms[currentRoom]) return;
         
-        const player = rooms[currentRoom].players[socket.id];
+        const player = getPlayer(rooms[currentRoom]);
         if (!player) return;
         
         player.ready = !player.ready;
@@ -799,6 +1080,7 @@ io.on('connection', (socket) => {
     // هذا داخل ملف server.js
     // استبدل السطر 482-513 بهذا الكود:
     socket.on('startGame', () => {
+        if (!allowEvent('startGame', 8, 10000)) return;
         const roomCode = socket.roomCode;
         const room = rooms[roomCode];
         
@@ -858,6 +1140,9 @@ io.on('connection', (socket) => {
             player.invisExpire = 0;
             player.speedExpire = 0;
             player.charging = false;
+            player.lastShotAt = 0;
+            player.inputSeq = 0;
+            player.antiCheatStrikes = 0;
             player.input = { w:false,a:false,s:false,d:false,angle:0,charging:false,seq:0 };
         });
         
@@ -885,20 +1170,30 @@ io.on('connection', (socket) => {
     
     // Player input (authoritative movement)
     socket.on('playerInput', (data) => {
+        if (!allowEvent('playerInput', 120, 1000)) return;
         const roomCode = socket.roomCode;
         const room = rooms[roomCode];
         if (!room || room.state !== 'playing') return;
-        const player = room.players[socket.id];
+        const player = getPlayer(room);
         if (!player || player.hp <= 0) return;
+
+        const rawAngle = (data && typeof data.angle === 'number') ? data.angle : player.angle;
+        const angle = Number.isFinite(rawAngle) ? rawAngle : player.angle;
+        const seq = (data && typeof data.seq === 'number') ? Math.floor(data.seq) : player.inputSeq;
+        if (seq < player.inputSeq - 2 || seq > player.inputSeq + MAX_INPUT_AHEAD_SEQ) {
+            player.antiCheatStrikes = (player.antiCheatStrikes || 0) + 1;
+            return;
+        }
+        player.inputSeq = Math.max(player.inputSeq || 0, seq);
 
         player.input = {
             w: !!data.w,
             a: !!data.a,
             s: !!data.s,
             d: !!data.d,
-            angle: typeof data.angle === 'number' ? data.angle : player.angle,
+            angle: angle,
             charging: !!data.charging,
-            seq: data.seq || 0
+            seq: player.inputSeq
         };
         player.lastUpdate = Date.now();
 
@@ -916,22 +1211,38 @@ io.on('connection', (socket) => {
     
     // Fire projectile
     socket.on('fireProjectile', (data) => {
+        if (!allowEvent('fireProjectile', 35, 1000)) return;
         if (!currentRoom || !rooms[currentRoom] || rooms[currentRoom].state !== 'playing') return;
         
-        const player = rooms[currentRoom].players[socket.id];
+        const player = getPlayer(rooms[currentRoom]);
         if (!player || player.hp <= 0) return;
+
+        const now = Date.now();
+        if (player.lastShotAt && (now - player.lastShotAt) < MIN_SHOT_INTERVAL_MS) {
+            player.antiCheatStrikes = (player.antiCheatStrikes || 0) + 1;
+            return;
+        }
+
+        const room = rooms[currentRoom];
+        const activeOwnerProjectiles = room.projectiles.filter(p => p.ownerId === player.id).length;
+        if (activeOwnerProjectiles >= MAX_ACTIVE_PROJECTILES_PER_PLAYER) {
+            player.antiCheatStrikes = (player.antiCheatStrikes || 0) + 1;
+            return;
+        }
 
         if (player.invisible) {
             player.invisible = false;
             player.invisExpire = 0;
         }
         
-        const angle = typeof data.angle === 'number' ? data.angle : player.angle;
+        const rawAngle = typeof data.angle === 'number' ? data.angle : player.angle;
+        const angle = Number.isFinite(rawAngle) ? rawAngle : player.angle;
+        if (!Number.isFinite(angle)) return;
         const speed = 871.2; // 14.52 * 60fps
         const offset = 25;
         const projectile = {
             id: `proj_${socket.id}_${Date.now()}`,
-            ownerId: socket.id,
+            ownerId: player.id,
             x: player.x + Math.cos(angle) * offset,
             y: player.y + Math.sin(angle) * offset,
             vx: Math.cos(angle) * speed,
@@ -940,6 +1251,7 @@ io.on('connection', (socket) => {
             life: 0
         };
         
+        player.lastShotAt = now;
         rooms[currentRoom].projectiles.push(projectile);
         
         io.to(currentRoom).emit('projectileFired', projectile);
@@ -947,6 +1259,7 @@ io.on('connection', (socket) => {
     });
 
     socket.on('leaveRoom', () => {
+        if (!allowEvent('leaveRoom', 12, 10000)) return;
         if (!socket.roomCode) return;
         const roomCode = socket.roomCode;
         socket.leave(roomCode);
@@ -954,12 +1267,35 @@ io.on('connection', (socket) => {
         socket.roomCode = null;
         currentRoom = null;
     });
+
+    socket.on('requestLobbyState', (data) => {
+        if (!allowEvent('requestLobbyState', 20, 10000)) return;
+        const resolved = resolveRoomForSocket(data);
+        if (!resolved) return;
+        emitLobbyUpdate(resolved.roomCode, socket);
+    });
+
+    socket.on('returnToLobby', (data) => {
+        if (!allowEvent('returnToLobby', 20, 10000)) return;
+        const resolved = resolveRoomForSocket(data);
+        if (!resolved) {
+            socket.emit('joinError', { message: 'Lobby not found' });
+            return;
+        }
+        const { roomCode, room } = resolved;
+        socket.emit('lobbySnapshot', {
+            roomCode: room.code,
+            leaderId: room.leader,
+            players: room.players,
+            state: room.state
+        });
+    });
     
     // Disconnect
    // استبدل السطر 563-589 بهذا:
 socket.on('disconnect', () => {
     console.log(`Player disconnected: ${socket.id}`);
-    removePlayerFromRoom();
+    removePlayerFromRoom({ preserveInMatch: true });
     
     if (socket.heartbeatInterval) {
         clearInterval(socket.heartbeatInterval);
@@ -1006,10 +1342,11 @@ setInterval(() => {
             // Check game time
             const elapsed = Date.now() - room.gameStartTime;
             if (elapsed >= GAME_DURATION * 1000) {
-                room.state = 'finished';
+                resetRoomForLobby(roomCode);
                 io.to(roomCode).emit('gameEnd', {
                     players: room.players
                 });
+                emitLobbyUpdate(roomCode);
             }
         }
     });
