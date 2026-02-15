@@ -1,4 +1,8 @@
+<<<<<<< HEAD
 const CACHE_NAME = 'headshooter-v3';
+=======
+const CACHE_NAME = 'headshooter-v2';
+>>>>>>> 994a45c5850e9eb5140dc6919318c2b441e96a7a
 const APP_SHELL = [
   '/',
   '/index.html',
