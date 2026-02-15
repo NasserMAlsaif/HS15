@@ -7,6 +7,7 @@ const http = require('http');
 const socketIO = require('socket.io');
 const path = require('path');
 const crypto = require('crypto');
+const fs = require('fs');
 
 const app = express();
 const server = http.createServer(app);
@@ -18,6 +19,23 @@ const io = socketIO(server, {
 });
 
 const PORT = process.env.PORT || 3000;
+const IS_DEV_MODE = process.env.NODE_ENV !== 'production';
+app.use(express.json());
+
+function envInt(name, fallback, min, max) {
+    const raw = Number(process.env[name]);
+    if (!Number.isFinite(raw)) return fallback;
+    const v = Math.floor(raw);
+    return Math.max(min, Math.min(max, v));
+}
+
+const ANTI_CHEAT_MODE = String(process.env.ANTI_CHEAT_MODE || 'observe').toLowerCase() === 'enforce'
+    ? 'enforce'
+    : 'observe';
+const DATA_DIR = path.join(__dirname, 'data');
+const ANTI_CHEAT_RECENT_FILE = path.join(DATA_DIR, 'anti-cheat-recent.jsonl');
+const ANTI_CHEAT_ESCALATIONS_FILE = path.join(DATA_DIR, 'anti-cheat-escalations.jsonl');
+const ANTI_CHEAT_SNAPSHOTS_FILE = path.join(DATA_DIR, 'anti-cheat-room-snapshots.jsonl');
 
 // ==================== GAME CONSTANTS ====================
 const MAP_WIDTH = 3000;
@@ -27,16 +45,53 @@ const TICK_MS = 1000 / TICK_RATE;
 const BASE_SPEED_PER_SEC = 127.05; // 2.1175 * 60fps
 const MAX_PLAYERS_PER_ROOM = 6;
 const BOT_COUNT = 5;
-const GAME_DURATION = 120; // 2 minutes
+const GAME_DURATION = 110; // 1 minute 50 seconds
 const PLAYER_RESPAWN_DELAY = 3000;
 const BUFF_RESPAWN_DELAY = 6000;
 const KILL_CHAIN_WINDOW = 6000;
 const COUNTDOWN_DURATION = 3000;
 const MIN_SHOT_INTERVAL_MS = 140; // server-side fire rate cap
+const BASE_CHARGE_REQUIRED_MS = 1000;
+const FAST_CHARGE_REQUIRED_MS = 850;
+const CHARGE_VALIDATION_GRACE_MS = 90;
+const SHOT_ORIGIN_TOLERANCE = 6;
+const SHOT_PATH_SAMPLE_STEP = 6;
 const MAX_ACTIVE_PROJECTILES_PER_PLAYER = 8;
 const MAX_INPUT_AHEAD_SEQ = 200;
+const MAX_INPUT_STALE_MS = 4000;
+const MAX_INPUT_SEQ_VALUE = 1000000000;
+const MAX_ABS_ANGLE = Math.PI * 32;
+const SHOT_ANGLE_WARN_DELTA = 1.8; // ~103 degrees
+const SHOT_ANGLE_HARD_DELTA = 2.75; // ~157 degrees
+const ANTI_CHEAT_LOG_COOLDOWN_MS = 2000;
 const SESSION_TTL_MS = 1000 * 60 * 60 * 24 * 14; // 14 days
 const SESSION_SECRET = process.env.SESSION_SECRET || 'headshooter-dev-secret-change-me';
+const MATCH_RESULT_TTL_MS = 30 * 60 * 1000;
+const MAX_ANTI_CHEAT_REASON_SAMPLE = 20;
+const MAX_ANTI_CHEAT_RECENT = 100;
+const RECONNECT_GUARD_WINDOW_MS = 20000;
+const MAX_RECONNECT_ATTEMPTS_IN_WINDOW = 6;
+const INPUT_TOGGLE_WINDOW_MS = 1500;
+const INPUT_TOGGLE_WARN_POINTS = 45;
+const CONNECTION_IP_WINDOW_MS = 60000;
+const MAX_CONNECTIONS_PER_IP_WINDOW = 90;
+const REGISTER_IP_WINDOW_MS = 30000;
+const MAX_REGISTER_PER_IP_WINDOW = 25;
+const REGISTER_PID_WINDOW_MS = 30000;
+const MAX_REGISTER_PER_PID_WINDOW = 12;
+const CREATE_IP_WINDOW_MS = 30000;
+const MAX_CREATE_PER_IP_WINDOW = 12;
+const JOIN_IP_WINDOW_MS = 30000;
+const MAX_JOIN_PER_IP_WINDOW = 25;
+const JOIN_PID_WINDOW_MS = 30000;
+const MAX_JOIN_PER_PID_WINDOW = 18;
+const STRIKE_WINDOW_MS = 15000;
+const STRIKE_WARN_THRESHOLD = envInt('ANTI_CHEAT_WARN_THRESHOLD', 3, 1, 200);
+const STRIKE_SOFT_BLOCK_THRESHOLD = envInt('ANTI_CHEAT_SOFT_THRESHOLD', 6, 1, 300);
+const STRIKE_HARD_BLOCK_THRESHOLD = envInt('ANTI_CHEAT_HARD_THRESHOLD', 10, 1, 500);
+const SOFT_BLOCK_MS = envInt('ANTI_CHEAT_SOFT_BLOCK_MS', 3000, 200, 600000);
+const HARD_BLOCK_MS = envInt('ANTI_CHEAT_HARD_BLOCK_MS', 8000, 500, 600000);
+const BLOCK_LOG_COOLDOWN_MS = 1200;
 
 const KILLSTREAK_TIERS = {
     EXTRA_CORE: 3,
@@ -187,6 +242,296 @@ const BUFF_TYPES = ['health', 'shield', 'invis', 'speed'];
 // ==================== ROOM MANAGEMENT ====================
 const rooms = {};
 const sessions = {}; // persistentId -> { token, name, exp }
+const pendingMatchResults = {}; // persistentId -> { roomCode, players, endedAt, exp }
+const antiCheatMetrics = {
+    startedAt: Date.now(),
+    totalSuspiciousEvents: 0,
+    reasons: {},
+    players: {},
+    recent: [],
+    timeline: [],
+    enforcements: {
+        warn: 0,
+        softBlock: 0,
+        hardBlock: 0,
+        wouldSoftBlock: 0,
+        wouldHardBlock: 0,
+        blockedEvents: 0
+    },
+    escalations: []
+};
+const reconnectGuard = {}; // persistentId -> { start, count }
+const handshakeGuards = {
+    connectionByIp: {},
+    registerByIp: {},
+    registerByPid: {},
+    createByIp: {},
+    joinByIp: {},
+    joinByPid: {}
+};
+
+function ensureDataDir() {
+    try {
+        if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    } catch (e) {
+        console.warn('[anti-cheat] failed to ensure data dir', e && e.message ? e.message : e);
+    }
+}
+
+function appendJsonl(filePath, obj) {
+    try {
+        ensureDataDir();
+        fs.appendFileSync(filePath, JSON.stringify(obj) + '\n', 'utf8');
+    } catch (e) {
+        console.warn('[anti-cheat] append jsonl failed', filePath, e && e.message ? e.message : e);
+    }
+}
+
+function readJsonl(filePath, limit, filterFn) {
+    try {
+        if (!fs.existsSync(filePath)) return [];
+        const raw = fs.readFileSync(filePath, 'utf8');
+        if (!raw) return [];
+        const lines = raw.trim().split('\n');
+        const max = Math.max(1, Math.min(2000, Number(limit) || 200));
+        const start = Math.max(0, lines.length - Math.max(max * 4, max));
+        const out = [];
+        for (let i = start; i < lines.length; i++) {
+            const line = lines[i].trim();
+            if (!line) continue;
+            try {
+                const obj = JSON.parse(line);
+                if (!filterFn || filterFn(obj)) out.push(obj);
+            } catch (_) {}
+        }
+        return out.slice(-max);
+    } catch (_) {
+        return [];
+    }
+}
+
+function normalizeIp(raw) {
+    if (!raw || typeof raw !== 'string') return 'unknown';
+    const first = raw.split(',')[0].trim();
+    return first.replace(/^::ffff:/, '') || 'unknown';
+}
+
+function allowWindowCounter(store, key, windowMs, maxCount) {
+    const now = Date.now();
+    const safeKey = key || 'unknown';
+    const bucket = store[safeKey] || { start: now, count: 0 };
+    if (now - bucket.start > windowMs) {
+        bucket.start = now;
+        bucket.count = 0;
+    }
+    bucket.count += 1;
+    store[safeKey] = bucket;
+    return bucket.count <= maxCount;
+}
+
+function recordSuspicionTimeline(now) {
+    antiCheatMetrics.timeline.push(now);
+    const cutoff = now - 60000;
+    while (antiCheatMetrics.timeline.length && antiCheatMetrics.timeline[0] < cutoff) {
+        antiCheatMetrics.timeline.shift();
+    }
+}
+
+function pushAntiCheatRecent(event) {
+    antiCheatMetrics.recent.push(event);
+    if (antiCheatMetrics.recent.length > MAX_ANTI_CHEAT_RECENT) {
+        antiCheatMetrics.recent.shift();
+    }
+    appendJsonl(ANTI_CHEAT_RECENT_FILE, event);
+}
+
+function pushAntiCheatEscalation(event) {
+    antiCheatMetrics.escalations.push(event);
+    if (antiCheatMetrics.escalations.length > MAX_ANTI_CHEAT_RECENT) {
+        antiCheatMetrics.escalations.shift();
+    }
+    appendJsonl(ANTI_CHEAT_ESCALATIONS_FILE, event);
+}
+
+function buildRoomSnapshot(now) {
+    return Object.entries(rooms).map(([roomCode, room]) => ({
+        roomCode,
+        state: room.state,
+        players: Object.keys(room.players || {}).length,
+        antiCheatEvents: room.antiCheatEvents || 0,
+        antiCheatScore: Number((room.antiCheatScore || 0).toFixed(2)),
+        blockedNow: Object.values(room.players || {}).filter((p) =>
+            p && p.antiCheatState && p.antiCheatState.blockUntil && p.antiCheatState.blockUntil > now
+        ).length,
+        escalatedPlayers: Object.values(room.players || {})
+            .filter((p) => p && p.antiCheatState && p.antiCheatState.windowStrikes > 0)
+            .map((p) => ({
+                playerId: p.id || null,
+                name: p.name || 'Player',
+                level: p.antiCheatState.level || 'none',
+                windowStrikes: p.antiCheatState.windowStrikes || 0,
+                blockUntil: p.antiCheatState.blockUntil || 0
+            }))
+            .sort((a, b) => b.windowStrikes - a.windowStrikes)
+            .slice(0, 10),
+        topRoomSuspects: Object.entries(room.antiCheatByPlayer || {})
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 5)
+            .map(([playerKey, score]) => ({ playerKey, score: Number(score.toFixed(2)) })),
+        gameStartTime: room.gameStartTime || null
+    }));
+}
+
+function appendAntiCheatSnapshot(now) {
+    appendJsonl(ANTI_CHEAT_SNAPSHOTS_FILE, {
+        ts: now || Date.now(),
+        connectedSockets: io.engine && typeof io.engine.clientsCount === 'number' ? io.engine.clientsCount : 0,
+        totalSuspiciousEvents: antiCheatMetrics.totalSuspiciousEvents,
+        suspiciousEventsPerMinute: antiCheatMetrics.timeline.length,
+        rooms: buildRoomSnapshot(now || Date.now())
+    });
+}
+
+function ensurePlayerAntiCheatState(player, now) {
+    const t = now || Date.now();
+    if (!player.antiCheatState) {
+        player.antiCheatState = {
+            windowStart: t,
+            windowStrikes: 0,
+            warned: false,
+            level: 'none',
+            blockUntil: 0,
+            lastBlockLogAt: 0,
+            lastAction: null,
+            lastActionAt: 0
+        };
+    }
+    const st = player.antiCheatState;
+    if (!st.windowStart || (t - st.windowStart) > STRIKE_WINDOW_MS) {
+        st.windowStart = t;
+        st.windowStrikes = 0;
+        st.warned = false;
+        st.level = 'none';
+        st.blockUntil = 0;
+    }
+    return st;
+}
+
+function findRoomPlayerEntry(room, playerKey) {
+    if (!room || !playerKey) return null;
+    if (room.players[playerKey]) return [playerKey, room.players[playerKey]];
+    let entry = Object.entries(room.players).find(([, p]) => p && p.id === playerKey);
+    if (entry) return entry;
+    entry = Object.entries(room.players).find(([, p]) => p && p.persistentId === playerKey);
+    if (entry) return entry;
+    entry = Object.entries(room.players).find(([, p]) => p && p.name === playerKey);
+    return entry || null;
+}
+
+function applySimulatedSuspicion(roomCode, playerKey, reason, count) {
+    const room = rooms[roomCode];
+    if (!room) return { ok: false, message: 'Room not found' };
+    const entry = findRoomPlayerEntry(room, playerKey);
+    if (!entry) return { ok: false, message: 'Player not found in room' };
+    const [resolvedKey, player] = entry;
+    const loops = Math.max(1, Math.min(50, Number(count) || 1));
+    const useReason = reason || 'simulated_suspicion';
+
+    for (let i = 0; i < loops; i++) {
+        const now = Date.now();
+        const st = ensurePlayerAntiCheatState(player, now);
+        player.antiCheatStrikes = (player.antiCheatStrikes || 0) + 1;
+        antiCheatMetrics.totalSuspiciousEvents += 1;
+        recordSuspicionTimeline(now);
+        antiCheatMetrics.reasons[useReason] = (antiCheatMetrics.reasons[useReason] || 0) + 1;
+
+        room.antiCheatEvents = (room.antiCheatEvents || 0) + 1;
+        const weighted = useReason.startsWith('fire_') ? 2.0 : 1.0;
+        room.antiCheatScore = (room.antiCheatScore || 0) + weighted;
+        if (!room.antiCheatByPlayer) room.antiCheatByPlayer = {};
+        const roomMetricKey = player.persistentId || player.id || resolvedKey;
+        room.antiCheatByPlayer[roomMetricKey] = (room.antiCheatByPlayer[roomMetricKey] || 0) + weighted;
+
+        const metricKey = player.persistentId || player.id || resolvedKey;
+        if (!antiCheatMetrics.players[metricKey]) {
+            antiCheatMetrics.players[metricKey] = {
+                id: player.id || resolvedKey,
+                persistentId: player.persistentId || null,
+                name: player.name || 'Player',
+                strikes: 0,
+                reasons: {}
+            };
+        }
+        antiCheatMetrics.players[metricKey].id = player.id || resolvedKey;
+        antiCheatMetrics.players[metricKey].name = player.name || antiCheatMetrics.players[metricKey].name;
+        antiCheatMetrics.players[metricKey].strikes += 1;
+        antiCheatMetrics.players[metricKey].reasons[useReason] =
+            (antiCheatMetrics.players[metricKey].reasons[useReason] || 0) + 1;
+
+        st.windowStrikes += 1;
+        let action = null;
+        if (st.windowStrikes >= STRIKE_HARD_BLOCK_THRESHOLD) {
+            st.level = 'hard';
+            st.blockUntil = Math.max(st.blockUntil || 0, now + HARD_BLOCK_MS);
+            action = 'hardBlock';
+        } else if (st.windowStrikes >= STRIKE_SOFT_BLOCK_THRESHOLD) {
+            if (st.level !== 'hard') st.level = 'soft';
+            st.blockUntil = Math.max(st.blockUntil || 0, now + SOFT_BLOCK_MS);
+            action = 'softBlock';
+        } else if (st.windowStrikes >= STRIKE_WARN_THRESHOLD && !st.warned) {
+            st.warned = true;
+            action = 'warn';
+        }
+        if (action) {
+            st.lastAction = action;
+            st.lastActionAt = now;
+            antiCheatMetrics.enforcements[action] = (antiCheatMetrics.enforcements[action] || 0) + 1;
+            pushAntiCheatEscalation({
+                ts: now,
+                action,
+                room: roomCode,
+                socketId: player.id || resolvedKey,
+                playerId: player.id || resolvedKey,
+                name: player.name || 'Player',
+                details: {
+                    simulated: true,
+                    reason: useReason,
+                    until: st.blockUntil || 0,
+                    windowStrikes: st.windowStrikes
+                }
+            });
+        }
+
+        pushAntiCheatRecent({
+            ts: now,
+            reason: useReason,
+            room: roomCode,
+            socketId: player.id || resolvedKey,
+            playerId: player.id || resolvedKey,
+            name: player.name || 'Player',
+            details: {
+                simulated: true,
+                windowStrikes: st.windowStrikes,
+                level: st.level || 'none'
+            }
+        });
+    }
+
+    const st = ensurePlayerAntiCheatState(player, Date.now());
+    return {
+        ok: true,
+        roomCode,
+        playerKey: resolvedKey,
+        playerId: player.id || resolvedKey,
+        playerName: player.name || 'Player',
+        reason: useReason,
+        applied: loops,
+        antiCheatStrikes: player.antiCheatStrikes || 0,
+        windowStrikes: st.windowStrikes || 0,
+        level: st.level || 'none',
+        blockUntil: st.blockUntil || 0
+    };
+}
 
 function toBase64Url(str) {
     return Buffer.from(str, 'utf8').toString('base64url');
@@ -248,6 +593,78 @@ function emitLobbyUpdate(roomCode, targetSocket = null) {
     io.to(roomCode).emit('lobbyUpdate', payload);
 }
 
+function clonePlayersForResults(room) {
+    const out = {};
+    Object.entries(room.players || {}).forEach(([key, p]) => {
+        out[key] = {
+            id: p.id,
+            persistentId: p.persistentId || null,
+            name: p.name || 'Player',
+            x: p.x || 0,
+            y: p.y || 0,
+            angle: p.angle || 0,
+            hp: p.hp || 0,
+            maxHp: p.maxHp || 3,
+            kills: p.kills || 0,
+            deaths: p.deaths || 0,
+            headshots: p.headshots || 0,
+            killstreak: p.killstreak || 0,
+            disconnected: !!p.disconnected
+        };
+    });
+    return out;
+}
+
+function storePendingMatchResults(roomCode, playersSnapshot) {
+    const now = Date.now();
+    Object.values(playersSnapshot || {}).forEach((p) => {
+        if (!p || !p.persistentId) return;
+        pendingMatchResults[p.persistentId] = {
+            roomCode,
+            players: playersSnapshot,
+            endedAt: now,
+            exp: now + MATCH_RESULT_TTL_MS
+        };
+    });
+}
+
+function emitPendingMatchResultsForSocket(socket) {
+    const pid = socket.authPersistentId;
+    if (!pid) return false;
+    const pending = pendingMatchResults[pid];
+    if (!pending) return false;
+    if (Date.now() > pending.exp) {
+        delete pendingMatchResults[pid];
+        return false;
+    }
+    socket.emit('matchResultsPending', {
+        roomCode: pending.roomCode,
+        players: pending.players,
+        endedAt: pending.endedAt
+    });
+    return true;
+}
+
+function emitRecentRoomResultsForSocket(socket) {
+    if (!socket || !socket.authPersistentId) return false;
+    const pid = socket.authPersistentId;
+    const now = Date.now();
+    for (const room of Object.values(rooms)) {
+        if (!room || !room.lastMatchResults || !room.lastMatchEndedAt) continue;
+        if (now - room.lastMatchEndedAt > MATCH_RESULT_TTL_MS) continue;
+        if (room.lastMatchSeen && room.lastMatchSeen[pid]) continue;
+        const found = Object.values(room.lastMatchResults).some((p) => p && p.persistentId === pid);
+        if (!found) continue;
+        socket.emit('matchResultsPending', {
+            roomCode: room.code,
+            players: room.lastMatchResults,
+            endedAt: room.lastMatchEndedAt
+        });
+        return true;
+    }
+    return false;
+}
+
 function resetRoomForLobby(roomCode) {
     const room = rooms[roomCode];
     if (!room) return;
@@ -256,11 +673,25 @@ function resetRoomForLobby(roomCode) {
     room.projectiles = [];
     room.killChains = {};
     room.nextSpawnIndex = 0;
+    room.antiCheatEvents = 0;
+    room.antiCheatScore = 0;
+    room.antiCheatByPlayer = {};
     Object.entries(room.players).forEach(([key, p]) => {
         p.ready = (key === room.leader);
         p.charging = false;
+        p.chargeStartedAt = 0;
         p.lastShotAt = 0;
         p.inputSeq = 0;
+        p.antiCheatState = {
+            windowStart: 0,
+            windowStrikes: 0,
+            warned: false,
+            level: 'none',
+            blockUntil: 0,
+            lastBlockLogAt: 0,
+            lastAction: null,
+            lastActionAt: 0
+        };
         p.input = {
             w: false,
             a: false,
@@ -270,6 +701,7 @@ function resetRoomForLobby(roomCode) {
             charging: false,
             seq: 0
         };
+        p.inputIntegrity = { lastMask: 0, lastAt: 0, togglePoints: 0, windowStart: 0 };
     });
 }
 
@@ -291,6 +723,12 @@ function createRoom(leaderId, leaderName, leaderPersistentId) {
         projectiles: [],
         buffs: [],
         killChains: {},
+        antiCheatEvents: 0,
+        antiCheatScore: 0,
+        antiCheatByPlayer: {},
+        lastMatchResults: null,
+        lastMatchEndedAt: 0,
+        lastMatchSeen: {},
         lastUpdate: Date.now()
     };
     
@@ -351,6 +789,20 @@ function isProjectileBlocked(mapKey, x, y) {
         const dx = x - o.x;
         const dy = y - o.y;
         if (Math.sqrt(dx * dx + dy * dy) < ow / 2 + 3) return true;
+    }
+    return false;
+}
+
+function isShotPathBlocked(mapKey, fromX, fromY, toX, toY) {
+    const dx = toX - fromX;
+    const dy = toY - fromY;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    const steps = Math.max(1, Math.ceil(dist / SHOT_PATH_SAMPLE_STEP));
+    for (let i = 1; i <= steps; i++) {
+        const t = i / steps;
+        const x = fromX + dx * t;
+        const y = fromY + dy * t;
+        if (isProjectileBlocked(mapKey, x, y)) return true;
     }
     return false;
 }
@@ -583,6 +1035,12 @@ function handleKill(roomCode, killerId, victimId, isHeadshot) {
             victim.y = spawn.y;
             victim.hp = victim.maxHp;
             victim.maxHp = 3; // Reset Extra Core
+            victim.charging = false;
+            victim.chargeStartedAt = 0;
+            victim.lastShotAt = 0;
+            victim.inputSeq = 0;
+            victim.input = { w: false, a: false, s: false, d: false, angle: victim.angle || 0, charging: false, seq: 0 };
+            victim.inputIntegrity = { lastMask: 0, lastAt: 0, togglePoints: 0, windowStart: 0 };
             
             io.to(roomCode).emit('playerRespawn', {
                 playerId: victimId,
@@ -686,10 +1144,22 @@ function makePlayer(socketId, playerName, persistentId, isLeader) {
         invisible: false,
         speedBoost: false,
         charging: false,
+        chargeStartedAt: 0,
         lastShotAt: 0,
         inputSeq: 0,
         antiCheatStrikes: 0,
+        antiCheatState: {
+            windowStart: 0,
+            windowStrikes: 0,
+            warned: false,
+            level: 'none',
+            blockUntil: 0,
+            lastBlockLogAt: 0,
+            lastAction: null,
+            lastActionAt: 0
+        },
         input: { w: false, a: false, s: false, d: false, angle: 0, charging: false, seq: 0 },
+        inputIntegrity: { lastMask: 0, lastAt: 0, togglePoints: 0, windowStart: 0 },
         lastUpdate: Date.now()
     };
 }
@@ -698,6 +1168,36 @@ function findPlayerEntryByPersistentId(room, persistentId) {
     if (!room || !persistentId) return null;
     const entry = Object.entries(room.players).find(([, p]) => p && p.persistentId === persistentId);
     return entry || null;
+}
+
+function normalizeAngle(angle) {
+    if (!Number.isFinite(angle)) return 0;
+    let a = angle;
+    const full = Math.PI * 2;
+    if (Math.abs(a) > MAX_ABS_ANGLE) {
+        a = a % full;
+    }
+    while (a > Math.PI) a -= full;
+    while (a < -Math.PI) a += full;
+    return a;
+}
+
+function angleDeltaAbs(a, b) {
+    const na = normalizeAngle(a);
+    const nb = normalizeAngle(b);
+    let d = Math.abs(na - nb);
+    if (d > Math.PI) d = (Math.PI * 2) - d;
+    return d;
+}
+
+function bitCount(v) {
+    let n = v >>> 0;
+    let c = 0;
+    while (n) {
+        c += n & 1;
+        n >>>= 1;
+    }
+    return c;
 }
 
 // ==================== SOCKET.IO EVENTS ====================
@@ -710,15 +1210,84 @@ io.on('connection', (socket) => {
     socket.authPersistentId = null;
     socket.authenticated = false;
     socket.rateLimits = {};
+    socket.lastAntiCheatLogAt = 0;
+    socket.clientIp = normalizeIp(
+        (socket.handshake && socket.handshake.headers && socket.handshake.headers['x-forwarded-for']) ||
+        (socket.handshake && socket.handshake.address) ||
+        (socket.conn && socket.conn.remoteAddress) ||
+        ''
+    );
     
     // Heartbeat
     heartbeatInterval = setInterval(() => {
         socket.emit('heartbeat');
     }, 5000);
 
+    function pushRecentSuspicion(event) {
+        pushAntiCheatRecent(event);
+    }
+
+    function registerRateLimitSuspicion(eventName) {
+        const now = Date.now();
+        const roomCode = socket.roomCode || null;
+        antiCheatMetrics.totalSuspiciousEvents += 1;
+        recordSuspicionTimeline(now);
+        const reason = `rate_limit:${eventName}`;
+        antiCheatMetrics.reasons[reason] = (antiCheatMetrics.reasons[reason] || 0) + 1;
+        if (roomCode && rooms[roomCode]) {
+            rooms[roomCode].antiCheatEvents = (rooms[roomCode].antiCheatEvents || 0) + 1;
+            rooms[roomCode].antiCheatScore = (rooms[roomCode].antiCheatScore || 0) + 1.5;
+        }
+        pushRecentSuspicion({
+            ts: now,
+            reason,
+            room: roomCode,
+            socketId: socket.id,
+            playerId: null,
+            name: socket.playerName || 'Unknown',
+            details: { eventName }
+        });
+    }
+
+    function ensureSocketPlayerBinding(room) {
+        if (!room) return null;
+
+        // Already bound.
+        if (socket.playerKey && room.players[socket.playerKey]) return socket.playerKey;
+
+        // Direct socket id key exists.
+        if (room.players[socket.id]) {
+            socket.playerKey = socket.id;
+            return socket.playerKey;
+        }
+
+        // Fallback by persistent identity.
+        if (!socket.authPersistentId) return null;
+        const entry = findPlayerEntryByPersistentId(room, socket.authPersistentId);
+        if (!entry) return null;
+
+        const [oldKey, player] = entry;
+        if (room.state === 'lobby' && oldKey !== socket.id) {
+            // In lobby, normalize record key to current socket.id for stable leader/actions.
+            delete room.players[oldKey];
+            player.id = socket.id;
+            player.name = socket.playerName || player.name;
+            player.disconnected = false;
+            player.lastUpdate = Date.now();
+            room.players[socket.id] = player;
+            if (room.leader === oldKey) room.leader = socket.id;
+            socket.playerKey = socket.id;
+            return socket.playerKey;
+        }
+
+        socket.playerKey = oldKey;
+        return socket.playerKey;
+    }
+
     function getPlayer(room) {
         if (!room) return null;
-        const key = socket.playerKey || socket.id;
+        const key = ensureSocketPlayerBinding(room);
+        if (!key) return null;
         return room.players[key] || null;
     }
 
@@ -731,7 +1300,189 @@ io.on('connection', (socket) => {
         }
         rl.count += 1;
         socket.rateLimits[eventName] = rl;
-        return rl.count <= maxCount;
+        const allowed = rl.count <= maxCount;
+        if (!allowed) registerRateLimitSuspicion(eventName);
+        return allowed;
+    }
+
+    function ensureAntiCheatState(player, now) {
+        const t = now || Date.now();
+        if (!player.antiCheatState) {
+            player.antiCheatState = {
+                windowStart: t,
+                windowStrikes: 0,
+                warned: false,
+                level: 'none',
+                blockUntil: 0,
+                lastBlockLogAt: 0,
+                lastAction: null,
+                lastActionAt: 0
+            };
+        }
+        const st = player.antiCheatState;
+        if (!st.windowStart || (t - st.windowStart) > STRIKE_WINDOW_MS) {
+            st.windowStart = t;
+            st.windowStrikes = 0;
+            st.warned = false;
+            st.level = 'none';
+            st.blockUntil = 0;
+        }
+        return st;
+    }
+
+    function pushEscalation(player, action, now, details) {
+        pushAntiCheatEscalation({
+            ts: now,
+            action,
+            room: socket.roomCode || null,
+            socketId: socket.id,
+            playerId: player.id || socket.id,
+            name: player.name || 'Player',
+            details: details || {}
+        });
+    }
+
+    function applySuspicionEscalation(player, reason, now) {
+        const st = ensureAntiCheatState(player, now);
+        st.windowStrikes += 1;
+        let action = null;
+        let actionDetails = null;
+        const enforce = ANTI_CHEAT_MODE === 'enforce';
+        let virtualUntil = 0;
+
+        if (st.windowStrikes >= STRIKE_HARD_BLOCK_THRESHOLD) {
+            st.level = 'hard';
+            virtualUntil = now + HARD_BLOCK_MS;
+            if (enforce) {
+                st.blockUntil = Math.max(st.blockUntil || 0, virtualUntil);
+            } else {
+                antiCheatMetrics.enforcements.wouldHardBlock = (antiCheatMetrics.enforcements.wouldHardBlock || 0) + 1;
+            }
+            action = 'hardBlock';
+            actionDetails = { reason, until: enforce ? (st.blockUntil || 0) : virtualUntil, windowStrikes: st.windowStrikes, mode: ANTI_CHEAT_MODE };
+        } else if (st.windowStrikes >= STRIKE_SOFT_BLOCK_THRESHOLD) {
+            if (st.level !== 'hard') st.level = 'soft';
+            virtualUntil = now + SOFT_BLOCK_MS;
+            if (enforce) {
+                st.blockUntil = Math.max(st.blockUntil || 0, virtualUntil);
+            } else {
+                antiCheatMetrics.enforcements.wouldSoftBlock = (antiCheatMetrics.enforcements.wouldSoftBlock || 0) + 1;
+            }
+            action = 'softBlock';
+            actionDetails = { reason, until: enforce ? (st.blockUntil || 0) : virtualUntil, windowStrikes: st.windowStrikes, mode: ANTI_CHEAT_MODE };
+        } else if (st.windowStrikes >= STRIKE_WARN_THRESHOLD && !st.warned) {
+            st.warned = true;
+            action = 'warn';
+            actionDetails = { reason, windowStrikes: st.windowStrikes, mode: ANTI_CHEAT_MODE };
+        }
+
+        if (action) {
+            st.lastAction = action;
+            st.lastActionAt = now;
+            antiCheatMetrics.enforcements[action] = (antiCheatMetrics.enforcements[action] || 0) + 1;
+            pushEscalation(player, action, now, actionDetails);
+            socket.emit('antiCheatAction', {
+                action,
+                until: actionDetails && actionDetails.until ? actionDetails.until : (st.blockUntil || 0),
+                windowStrikes: st.windowStrikes,
+                mode: ANTI_CHEAT_MODE
+            });
+        }
+    }
+
+    function isEnforcementBlocked(player, eventName) {
+        if (ANTI_CHEAT_MODE !== 'enforce') return false;
+        const now = Date.now();
+        const st = ensureAntiCheatState(player, now);
+        if (!st.blockUntil || now >= st.blockUntil) return false;
+
+        const blocked = (st.level === 'hard' && (eventName === 'playerInput' || eventName === 'fireProjectile')) ||
+            (st.level === 'soft' && eventName === 'fireProjectile');
+        if (!blocked) return false;
+
+        if (!st.lastBlockLogAt || (now - st.lastBlockLogAt) > BLOCK_LOG_COOLDOWN_MS) {
+            st.lastBlockLogAt = now;
+            antiCheatMetrics.enforcements.blockedEvents += 1;
+            antiCheatMetrics.totalSuspiciousEvents += 1;
+            recordSuspicionTimeline(now);
+            const reason = `enforcement_block:${eventName}`;
+            antiCheatMetrics.reasons[reason] = (antiCheatMetrics.reasons[reason] || 0) + 1;
+            pushRecentSuspicion({
+                ts: now,
+                reason,
+                room: socket.roomCode || null,
+                socketId: socket.id,
+                playerId: player.id || socket.id,
+                name: player.name || 'Player',
+                details: { level: st.level, until: st.blockUntil }
+            });
+        }
+        return true;
+    }
+
+    function registerSuspicion(player, reason, details) {
+        if (!player) return;
+        const now = Date.now();
+        const st = ensureAntiCheatState(player, now);
+        player.antiCheatStrikes = (player.antiCheatStrikes || 0) + 1;
+        antiCheatMetrics.totalSuspiciousEvents += 1;
+        recordSuspicionTimeline(now);
+        antiCheatMetrics.reasons[reason] = (antiCheatMetrics.reasons[reason] || 0) + 1;
+        if (socket.roomCode && rooms[socket.roomCode]) {
+            const room = rooms[socket.roomCode];
+            room.antiCheatEvents = (room.antiCheatEvents || 0) + 1;
+            const weighted = reason.startsWith('fire_') ? 2.0 : 1.0;
+            room.antiCheatScore = (room.antiCheatScore || 0) + weighted;
+            const roomKey = player.persistentId || player.id || socket.id;
+            if (!room.antiCheatByPlayer) room.antiCheatByPlayer = {};
+            room.antiCheatByPlayer[roomKey] = (room.antiCheatByPlayer[roomKey] || 0) + weighted;
+        }
+        const metricKey = player.persistentId || player.id || socket.id;
+        if (!antiCheatMetrics.players[metricKey]) {
+            antiCheatMetrics.players[metricKey] = {
+                id: player.id || socket.id,
+                persistentId: player.persistentId || null,
+                name: player.name || 'Player',
+                strikes: 0,
+                reasons: {}
+            };
+        }
+        antiCheatMetrics.players[metricKey].id = player.id || socket.id;
+        antiCheatMetrics.players[metricKey].name = player.name || antiCheatMetrics.players[metricKey].name;
+        antiCheatMetrics.players[metricKey].strikes += 1;
+        antiCheatMetrics.players[metricKey].reasons[reason] =
+            (antiCheatMetrics.players[metricKey].reasons[reason] || 0) + 1;
+        pushRecentSuspicion({
+            ts: now,
+            reason,
+            room: socket.roomCode || null,
+            socketId: socket.id,
+            playerId: player.id || socket.id,
+            name: player.name || 'Player',
+            details: {
+                ...(details || {}),
+                windowStrikes: st.windowStrikes + 1,
+                level: st.level || 'none'
+            }
+        });
+        applySuspicionEscalation(player, reason, now);
+        if (now - (socket.lastAntiCheatLogAt || 0) < ANTI_CHEAT_LOG_COOLDOWN_MS) return;
+        socket.lastAntiCheatLogAt = now;
+        console.warn('[anti-cheat]', reason, {
+            room: socket.roomCode || null,
+            socketId: socket.id,
+            playerId: player.id,
+            name: player.name,
+            strikes: player.antiCheatStrikes,
+            ...(details || {})
+        });
+    }
+
+    if (!allowWindowCounter(handshakeGuards.connectionByIp, socket.clientIp, CONNECTION_IP_WINDOW_MS, MAX_CONNECTIONS_PER_IP_WINDOW)) {
+        registerRateLimitSuspicion('connection_ip');
+        socket.emit('authError', { message: 'Too many connection attempts. Please wait.' });
+        socket.disconnect(true);
+        return;
     }
 
     function resolveRoomForSocket(data) {
@@ -753,6 +1504,9 @@ io.on('connection', (socket) => {
         if (!room) return null;
 
         socket.roomCode = roomCode;
+        currentRoom = roomCode;
+        // Ensure socket receives room broadcasts after reconnect/back-to-lobby flow.
+        socket.join(roomCode);
         if (!socket.playerKey || !room.players[socket.playerKey]) {
             const keyBySocket = room.players[socket.id] ? socket.id : null;
             if (keyBySocket) {
@@ -762,6 +1516,7 @@ io.on('connection', (socket) => {
                 if (entry) socket.playerKey = entry[0];
             }
         }
+        ensureSocketPlayerBinding(room);
         return { roomCode, room };
     }
 
@@ -779,6 +1534,8 @@ io.on('connection', (socket) => {
         if (preserveInMatch && inMatch) {
             player.disconnected = true;
             player.input = { w: false, a: false, s: false, d: false, angle: player.angle || 0, charging: false, seq: 0 };
+            player.inputIntegrity = { lastMask: 0, lastAt: 0, togglePoints: 0, windowStart: 0 };
+            player.chargeStartedAt = 0;
             socket.leave(roomCode);
             console.log(`Player ${player.name} disconnected (preserved) in room ${roomCode}`);
 
@@ -825,9 +1582,19 @@ io.on('connection', (socket) => {
     // داخل io.on('connection', ...) في ملف server.js
     socket.on('registerPlayer', (data) => {
         if (!allowEvent('registerPlayer', 12, 10000)) return;
+        if (!allowWindowCounter(handshakeGuards.registerByIp, socket.clientIp, REGISTER_IP_WINDOW_MS, MAX_REGISTER_PER_IP_WINDOW)) {
+            registerRateLimitSuspicion('register_ip');
+            socket.emit('authError', { message: 'Too many register attempts. Please wait.' });
+            return;
+        }
         const incomingId = (data && typeof data.id === 'string') ? data.id.trim() : '';
         const incomingName = (data && typeof data.name === 'string') ? data.name.trim() : 'Player';
         const incomingToken = data && typeof data.token === 'string' ? data.token : '';
+        if (incomingId && !allowWindowCounter(handshakeGuards.registerByPid, incomingId, REGISTER_PID_WINDOW_MS, MAX_REGISTER_PER_PID_WINDOW)) {
+            registerRateLimitSuspicion('register_pid');
+            socket.emit('authError', { message: 'Too many register attempts for this session. Please wait.' });
+            return;
+        }
         if (!incomingId || incomingId.length < 6 || incomingId.length > 64) {
             socket.emit('authError', { message: 'Invalid player identity.' });
             return;
@@ -850,12 +1617,31 @@ io.on('connection', (socket) => {
         socket.emit('sessionToken', { token: newToken, exp: sessions[incomingId].exp });
         console.log(`Player recognized: ${socket.playerName} with ID: ${incomingId}`);
 
+        // If this device has a finished match pending, show results after reconnect.
+        emitPendingMatchResultsForSocket(socket) || emitRecentRoomResultsForSocket(socket);
+
         // Auto-reconnect to an active match by persistent ID
         if (!socket.authPersistentId) return;
         for (const [roomCode, room] of Object.entries(rooms)) {
             if (!room || room.state !== 'playing') continue;
             const entry = findPlayerEntryByPersistentId(room, socket.authPersistentId);
             if (!entry) continue;
+
+            const now = Date.now();
+            const g = reconnectGuard[socket.authPersistentId] || { start: now, count: 0 };
+            if (now - g.start > RECONNECT_GUARD_WINDOW_MS) {
+                g.start = now;
+                g.count = 0;
+            }
+            g.count += 1;
+            reconnectGuard[socket.authPersistentId] = g;
+            if (g.count > MAX_RECONNECT_ATTEMPTS_IN_WINDOW) {
+                registerRateLimitSuspicion('reconnect_guard');
+                socket.emit('reconnectLimited', {
+                    retryAfterMs: Math.max(1000, RECONNECT_GUARD_WINDOW_MS - (now - g.start))
+                });
+                return;
+            }
 
             const [oldKey, player] = entry;
             if (!player.disconnected) continue;
@@ -878,6 +1664,8 @@ io.on('connection', (socket) => {
                 charging: false,
                 seq: 0
             };
+            player.inputIntegrity = { lastMask: 0, lastAt: 0, togglePoints: 0, windowStart: 0 };
+            player.chargeStartedAt = 0;
             room.players[socket.id] = player;
 
             if (room.leader === oldKey) room.leader = socket.id;
@@ -904,10 +1692,24 @@ io.on('connection', (socket) => {
             if (player) player.lastUpdate = Date.now();
         }
     });
+
+    socket.on('clientPing', (data) => {
+        const payload = {
+            t: data && Number.isFinite(data.t) ? data.t : 0,
+            serverTime: Date.now()
+        };
+        socket.emit('clientPong', payload);
+        socket.emit('serverPong', payload);
+    });
     
     // Create room
     socket.on('createRoom', (data) => {
     if (!allowEvent('createRoom', 4, 10000)) return;
+    if (!allowWindowCounter(handshakeGuards.createByIp, socket.clientIp, CREATE_IP_WINDOW_MS, MAX_CREATE_PER_IP_WINDOW)) {
+        registerRateLimitSuspicion('create_room_ip');
+        socket.emit('error', { message: 'Too many room create attempts. Please wait.' });
+        return;
+    }
     if (!socket.authenticated || !socket.authPersistentId) {
         socket.emit('authError', { message: 'Please re-authenticate.' });
         return;
@@ -937,8 +1739,18 @@ io.on('connection', (socket) => {
     // Join room
     socket.on('joinRoom', (data) => {
         if (!allowEvent('joinRoom', 6, 10000)) return;
+        if (!allowWindowCounter(handshakeGuards.joinByIp, socket.clientIp, JOIN_IP_WINDOW_MS, MAX_JOIN_PER_IP_WINDOW)) {
+            registerRateLimitSuspicion('join_room_ip');
+            socket.emit('joinError', { message: 'Too many join attempts. Please wait.' });
+            return;
+        }
         if (!socket.authenticated || !socket.authPersistentId) {
             socket.emit('authError', { message: 'Please re-authenticate.' });
+            return;
+        }
+        if (!allowWindowCounter(handshakeGuards.joinByPid, socket.authPersistentId, JOIN_PID_WINDOW_MS, MAX_JOIN_PER_PID_WINDOW)) {
+            registerRateLimitSuspicion('join_room_pid');
+            socket.emit('joinError', { message: 'Too many join attempts for this session. Please wait.' });
             return;
         }
         const code = data.roomCode;
@@ -975,6 +1787,8 @@ io.on('connection', (socket) => {
                             charging: false,
                             seq: 0
                         };
+                        player.inputIntegrity = { lastMask: 0, lastAt: 0, togglePoints: 0, windowStart: 0 };
+                        player.chargeStartedAt = 0;
                         room.players[socket.id] = player;
                         if (room.leader === oldKey) room.leader = socket.id;
 
@@ -1025,9 +1839,9 @@ io.on('connection', (socket) => {
     
     socket.on('playerReady', () => {
         if (!allowEvent('playerReady', 20, 10000)) return;
-        // استخدم socket.roomCode بدلاً من البحث
         const roomCode = socket.roomCode;
         const room = rooms[roomCode];
+        ensureSocketPlayerBinding(room);
         
         const player = getPlayer(room);
         if (!room || !player) {
@@ -1076,30 +1890,25 @@ io.on('connection', (socket) => {
     });
     
     // Start game (leader only)
-    // Start game (leader only)
-    // هذا داخل ملف server.js
-    // استبدل السطر 482-513 بهذا الكود:
     socket.on('startGame', () => {
         if (!allowEvent('startGame', 8, 10000)) return;
         const roomCode = socket.roomCode;
         const room = rooms[roomCode];
+        ensureSocketPlayerBinding(room);
         
         if (!room) {
             socket.emit('error', { message: 'Room not found' });
             return;
         }
         
-        // التأكد أن الشخص هو القائد
-        if (room.leader !== socket.id) {
+        if (room.leader !== (socket.playerKey || socket.id)) {
             socket.emit('error', { message: 'Only the leader can start' });
             return;
         }
-        
-        const playerList = Object.values(room.players);
-        
-        // فحص جاهزية جميع اللاعبين (ما عدا القائد)
-        const allReady = playerList.every(p => {
-            if (p.id === room.leader) return true; // القائد دائماً جاهز
+
+        const allReady = Object.entries(room.players).every(([key, p]) => {
+            if (p.disconnected) return false;
+            if (key === room.leader) return true;
             return p.ready === true;
         });
         
@@ -1108,15 +1917,15 @@ io.on('connection', (socket) => {
             return;
         }
         
-        // اختيار خريطة عشوائية
         const maps = ['forest', 'canyon', 'island'];
         const selectedMap = maps[Math.floor(Math.random() * maps.length)];
         
-        // تحديث حالة الغرفة
         room.state = 'starting';
         room.selectedMap = selectedMap;
+        room.lastMatchResults = null;
+        room.lastMatchEndedAt = 0;
+        room.lastMatchSeen = {};
 
-        // تهيئة حالة اللعبة
         room.projectiles = [];
         room.killChains = {};
         room.buffs = [];
@@ -1140,22 +1949,32 @@ io.on('connection', (socket) => {
             player.invisExpire = 0;
             player.speedExpire = 0;
             player.charging = false;
+            player.chargeStartedAt = 0;
             player.lastShotAt = 0;
             player.inputSeq = 0;
             player.antiCheatStrikes = 0;
+            player.antiCheatState = {
+                windowStart: 0,
+                windowStrikes: 0,
+                warned: false,
+                level: 'none',
+                blockUntil: 0,
+                lastBlockLogAt: 0,
+                lastAction: null,
+                lastActionAt: 0
+            };
             player.input = { w:false,a:false,s:false,d:false,angle:0,charging:false,seq:0 };
+            player.inputIntegrity = { lastMask: 0, lastAt: 0, togglePoints: 0, windowStart: 0 };
         });
         
         console.log(`Game starting in room ${roomCode} with map: ${selectedMap}`);
         
-        // إرسال أمر البداية للجميع
         io.to(roomCode).emit('gameStarting', {
             mapKey: selectedMap,
             players: room.players,
             roomCode: roomCode
         });
         
-        // بعد 3 ثواني (countdown) نبدأ اللعبة فعلياً
         setTimeout(() => {
             if (rooms[roomCode] && rooms[roomCode].state === 'starting') {
                 rooms[roomCode].state = 'playing';
@@ -1167,35 +1986,98 @@ io.on('connection', (socket) => {
             }
         }, 3000);
     });
-    
     // Player input (authoritative movement)
     socket.on('playerInput', (data) => {
-        if (!allowEvent('playerInput', 120, 1000)) return;
+        if (!allowEvent('playerInput', 90, 1000)) return;
         const roomCode = socket.roomCode;
         const room = rooms[roomCode];
         if (!room || room.state !== 'playing') return;
         const player = getPlayer(room);
         if (!player || player.hp <= 0) return;
+        if (isEnforcementBlocked(player, 'playerInput')) return;
 
-        const rawAngle = (data && typeof data.angle === 'number') ? data.angle : player.angle;
-        const angle = Number.isFinite(rawAngle) ? rawAngle : player.angle;
-        const seq = (data && typeof data.seq === 'number') ? Math.floor(data.seq) : player.inputSeq;
-        if (seq < player.inputSeq - 2 || seq > player.inputSeq + MAX_INPUT_AHEAD_SEQ) {
-            player.antiCheatStrikes = (player.antiCheatStrikes || 0) + 1;
+        if (!data || typeof data !== 'object') {
+            registerSuspicion(player, 'invalid_player_input_payload');
             return;
         }
-        player.inputSeq = Math.max(player.inputSeq || 0, seq);
 
+        const now = Date.now();
+        const seqRaw = (typeof data.seq === 'number') ? data.seq : player.inputSeq;
+        const seq = Number.isFinite(seqRaw) ? Math.floor(seqRaw) : player.inputSeq;
+        if (seq < 0 || seq > MAX_INPUT_SEQ_VALUE) {
+            registerSuspicion(player, 'input_seq_out_of_range', { seq: seqRaw });
+            return;
+        }
+        if (seq < player.inputSeq - 2 || seq > player.inputSeq + MAX_INPUT_AHEAD_SEQ) {
+            registerSuspicion(player, 'input_seq_window_violation', { seq, expected: player.inputSeq });
+            return;
+        }
+
+        const rawAngle = (typeof data.angle === 'number') ? data.angle : player.angle;
+        if (!Number.isFinite(rawAngle)) {
+            registerSuspicion(player, 'input_invalid_angle', { angle: data.angle });
+            return;
+        }
+        const angle = normalizeAngle(rawAngle);
+
+        player.inputSeq = Math.max(player.inputSeq || 0, seq);
+        const inW = !!data.w;
+        const inA = !!data.a;
+        const inS = !!data.s;
+        const inD = !!data.d;
+        const inCharging = !!data.charging;
+
+        if (!player.inputIntegrity) {
+            player.inputIntegrity = { lastMask: 0, lastAt: 0, togglePoints: 0, windowStart: now };
+        }
+        const ii = player.inputIntegrity;
+        if (!ii.windowStart || now - ii.windowStart > INPUT_TOGGLE_WINDOW_MS) {
+            ii.windowStart = now;
+            ii.togglePoints = 0;
+        }
+        const mask = (inW ? 1 : 0) | (inA ? 2 : 0) | (inS ? 4 : 0) | (inD ? 8 : 0) | (inCharging ? 16 : 0);
+        if (ii.lastAt > 0) {
+            const dtInput = Math.max(1, now - ii.lastAt);
+            const changed = bitCount(mask ^ ii.lastMask);
+            if (changed > 0) {
+                let weight = 1;
+                if (dtInput < 50) weight = 3;
+                else if (dtInput < 100) weight = 2;
+                ii.togglePoints += changed * weight;
+            } else if (ii.togglePoints > 0 && dtInput > 120) {
+                ii.togglePoints -= 1;
+            }
+        }
+        if ((inW && inS) || (inA && inD)) {
+            ii.togglePoints += 1;
+        }
+        ii.lastMask = mask;
+        ii.lastAt = now;
+        if (ii.togglePoints >= INPUT_TOGGLE_WARN_POINTS) {
+            registerSuspicion(player, 'input_toggle_spam', {
+                togglePoints: ii.togglePoints,
+                windowMs: now - ii.windowStart
+            });
+            ii.windowStart = now;
+            ii.togglePoints = 0;
+        }
+
+        const wasCharging = !!(player.input && player.input.charging);
         player.input = {
-            w: !!data.w,
-            a: !!data.a,
-            s: !!data.s,
-            d: !!data.d,
+            w: inW,
+            a: inA,
+            s: inS,
+            d: inD,
             angle: angle,
-            charging: !!data.charging,
+            charging: inCharging,
             seq: player.inputSeq
         };
-        player.lastUpdate = Date.now();
+        if (inCharging && !wasCharging) {
+            player.chargeStartedAt = now;
+        } else if (!inCharging) {
+            player.chargeStartedAt = 0;
+        }
+        player.lastUpdate = now;
 
         if (player.invisible && player.input.charging) {
             player.invisible = false;
@@ -1211,22 +2093,47 @@ io.on('connection', (socket) => {
     
     // Fire projectile
     socket.on('fireProjectile', (data) => {
-        if (!allowEvent('fireProjectile', 35, 1000)) return;
+        if (!allowEvent('fireProjectile', 18, 1000)) return;
         if (!currentRoom || !rooms[currentRoom] || rooms[currentRoom].state !== 'playing') return;
         
         const player = getPlayer(rooms[currentRoom]);
         if (!player || player.hp <= 0) return;
+        if (isEnforcementBlocked(player, 'fireProjectile')) return;
 
         const now = Date.now();
+        if ((now - (player.lastUpdate || 0)) > MAX_INPUT_STALE_MS) {
+            registerSuspicion(player, 'shot_with_stale_input', { staleMs: now - (player.lastUpdate || 0) });
+            return;
+        }
+
+        if (!data || typeof data !== 'object') {
+            registerSuspicion(player, 'invalid_fire_payload');
+            return;
+        }
+
         if (player.lastShotAt && (now - player.lastShotAt) < MIN_SHOT_INTERVAL_MS) {
-            player.antiCheatStrikes = (player.antiCheatStrikes || 0) + 1;
+            registerSuspicion(player, 'fire_rate_violation', { delta: now - player.lastShotAt });
+            return;
+        }
+        const chargeRequiredMs = (player.killstreak >= KILLSTREAK_TIERS.FAST_CHARGE)
+            ? FAST_CHARGE_REQUIRED_MS
+            : BASE_CHARGE_REQUIRED_MS;
+        const chargeHeldMs = (player.chargeStartedAt && player.input && player.input.charging)
+            ? (now - player.chargeStartedAt)
+            : 0;
+        if (chargeHeldMs < (chargeRequiredMs - CHARGE_VALIDATION_GRACE_MS)) {
+            registerSuspicion(player, 'fire_charge_violation', {
+                heldMs: chargeHeldMs,
+                requiredMs: chargeRequiredMs,
+                charging: !!(player.input && player.input.charging)
+            });
             return;
         }
 
         const room = rooms[currentRoom];
         const activeOwnerProjectiles = room.projectiles.filter(p => p.ownerId === player.id).length;
         if (activeOwnerProjectiles >= MAX_ACTIVE_PROJECTILES_PER_PLAYER) {
-            player.antiCheatStrikes = (player.antiCheatStrikes || 0) + 1;
+            registerSuspicion(player, 'active_projectile_cap_exceeded', { activeOwnerProjectiles });
             return;
         }
 
@@ -1235,16 +2142,61 @@ io.on('connection', (socket) => {
             player.invisExpire = 0;
         }
         
-        const rawAngle = typeof data.angle === 'number' ? data.angle : player.angle;
-        const angle = Number.isFinite(rawAngle) ? rawAngle : player.angle;
-        if (!Number.isFinite(angle)) return;
+        const rawAngle = (typeof data.angle === 'number') ? data.angle : player.angle;
+        if (!Number.isFinite(rawAngle)) {
+            registerSuspicion(player, 'fire_invalid_angle', { angle: data.angle });
+            return;
+        }
+        const angle = normalizeAngle(rawAngle);
+        const inputAngle = player.input && Number.isFinite(player.input.angle) ? player.input.angle : player.angle;
+        const delta = angleDeltaAbs(angle, inputAngle);
+        if (delta > SHOT_ANGLE_WARN_DELTA) {
+            registerSuspicion(player, 'fire_angle_mismatch', {
+                delta: Number(delta.toFixed(3)),
+                shotAngle: Number(angle.toFixed(3)),
+                inputAngle: Number(normalizeAngle(inputAngle).toFixed(3))
+            });
+        }
+        if (delta > SHOT_ANGLE_HARD_DELTA) {
+            registerSuspicion(player, 'fire_angle_hard_reject', {
+                delta: Number(delta.toFixed(3))
+            });
+            return;
+        }
         const speed = 871.2; // 14.52 * 60fps
         const offset = 25;
+        const mapKey = room.selectedMap || room.map || 'forest';
+        const originX = player.x + Math.cos(angle) * offset;
+        const originY = player.y + Math.sin(angle) * offset;
+        const originDist = Math.sqrt(((originX - player.x) ** 2) + ((originY - player.y) ** 2));
+        if (Math.abs(originDist - offset) > SHOT_ORIGIN_TOLERANCE) {
+            registerSuspicion(player, 'fire_origin_distance_mismatch', {
+                originDist: Number(originDist.toFixed(3)),
+                expected: offset
+            });
+            return;
+        }
+        if (isProjectileBlocked(mapKey, originX, originY)) {
+            registerSuspicion(player, 'fire_origin_blocked', {
+                x: Number(originX.toFixed(1)),
+                y: Number(originY.toFixed(1))
+            });
+            return;
+        }
+        if (isShotPathBlocked(mapKey, player.x, player.y, originX, originY)) {
+            registerSuspicion(player, 'fire_path_blocked', {
+                fromX: Number(player.x.toFixed(1)),
+                fromY: Number(player.y.toFixed(1)),
+                toX: Number(originX.toFixed(1)),
+                toY: Number(originY.toFixed(1))
+            });
+            return;
+        }
         const projectile = {
             id: `proj_${socket.id}_${Date.now()}`,
             ownerId: player.id,
-            x: player.x + Math.cos(angle) * offset,
-            y: player.y + Math.sin(angle) * offset,
+            x: originX,
+            y: originY,
             vx: Math.cos(angle) * speed,
             vy: Math.sin(angle) * speed,
             angle: angle,
@@ -1252,6 +2204,7 @@ io.on('connection', (socket) => {
         };
         
         player.lastShotAt = now;
+        player.chargeStartedAt = 0;
         rooms[currentRoom].projectiles.push(projectile);
         
         io.to(currentRoom).emit('projectileFired', projectile);
@@ -1282,15 +2235,85 @@ io.on('connection', (socket) => {
             socket.emit('joinError', { message: 'Lobby not found' });
             return;
         }
-        const { roomCode, room } = resolved;
+        const { room, roomCode } = resolved;
         socket.emit('lobbySnapshot', {
             roomCode: room.code,
             leaderId: room.leader,
             players: room.players,
-            state: room.state
+            state: room.state,
+            ok: true
+        });
+        emitLobbyUpdate(roomCode);
+    });
+
+    socket.on('ackMatchResults', () => {
+        if (!socket.authPersistentId) return;
+        const pid = socket.authPersistentId;
+        delete pendingMatchResults[pid];
+
+        // Mark recent room snapshot as seen by this player to avoid re-opening results overlay.
+        Object.values(rooms).forEach((room) => {
+            if (!room || !room.lastMatchResults || !room.lastMatchEndedAt) return;
+            const found = Object.values(room.lastMatchResults).some((p) => p && p.persistentId === pid);
+            if (!found) return;
+            if (!room.lastMatchSeen) room.lastMatchSeen = {};
+            room.lastMatchSeen[pid] = true;
         });
     });
-    
+
+    socket.on('kickPlayer', (data) => {
+        if (!allowEvent('kickPlayer', 8, 10000)) return;
+        const roomCode = socket.roomCode;
+        const room = rooms[roomCode];
+        ensureSocketPlayerBinding(room);
+        if (!room || room.state !== 'lobby') {
+            socket.emit('error', { message: 'Kick allowed in lobby only' });
+            return;
+        }
+        if (room.leader !== (socket.playerKey || socket.id)) {
+            socket.emit('error', { message: 'Only leader can kick' });
+            return;
+        }
+
+        const targetKey = data && typeof data.playerKey === 'string' ? data.playerKey : '';
+        const targetId = data && typeof data.playerId === 'string' ? data.playerId : '';
+
+        let removeKey = '';
+        if (targetKey && room.players[targetKey]) {
+            removeKey = targetKey;
+        } else if (targetId && room.players[targetId]) {
+            removeKey = targetId;
+        } else if (targetId) {
+            const foundEntry = Object.entries(room.players).find(([, p]) => p && p.id === targetId);
+            if (foundEntry) removeKey = foundEntry[0];
+        }
+
+        if (!removeKey || removeKey === room.leader || !room.players[removeKey]) {
+            socket.emit('error', { message: 'Invalid target' });
+            return;
+        }
+
+        const targetPlayer = room.players[removeKey];
+        delete room.players[removeKey];
+
+        let targetSocket = io.sockets.sockets.get(removeKey) || io.sockets.sockets.get(targetId);
+        if (!targetSocket && targetPlayer && targetPlayer.persistentId) {
+            targetSocket = Array.from(io.sockets.sockets.values()).find((s) => s && s.authPersistentId === targetPlayer.persistentId) || null;
+        }
+        if (targetSocket) {
+            targetSocket.leave(roomCode);
+            targetSocket.roomCode = null;
+            targetSocket.playerKey = targetSocket.id;
+            targetSocket.authRoomCode = null;
+            targetSocket.emit('kickedFromParty', { roomCode, by: socket.id });
+        }
+
+        io.to(roomCode).emit('playerLeft', {
+            playerId: targetPlayer && targetPlayer.id ? targetPlayer.id : targetId,
+            playerName: targetPlayer ? targetPlayer.name : 'Unknown'
+        });
+        emitLobbyUpdate(roomCode);
+    });
     // Disconnect
    // استبدل السطر 563-589 بهذا:
 socket.on('disconnect', () => {
@@ -1315,6 +2338,7 @@ setInterval(() => {
 
             io.to(roomCode).emit('stateUpdate', {
                 serverTime: Date.now(),
+                remainingMs: Math.max(0, (GAME_DURATION * 1000) - (Date.now() - room.gameStartTime)),
                 players: Object.values(room.players).map(p => ({
                     id: p.id,
                     name: p.name,
@@ -1342,9 +2366,16 @@ setInterval(() => {
             // Check game time
             const elapsed = Date.now() - room.gameStartTime;
             if (elapsed >= GAME_DURATION * 1000) {
+                const resultPlayers = clonePlayersForResults(room);
+                const endedAt = Date.now();
+                storePendingMatchResults(roomCode, resultPlayers);
+                room.lastMatchResults = resultPlayers;
+                room.lastMatchEndedAt = endedAt;
                 resetRoomForLobby(roomCode);
                 io.to(roomCode).emit('gameEnd', {
-                    players: room.players
+                    roomCode: roomCode,
+                    players: resultPlayers,
+                    endedAt
                 });
                 emitLobbyUpdate(roomCode);
             }
@@ -1359,7 +2390,221 @@ app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
+app.all('/admin/simulate-suspicion', (req, res) => {
+    if (!IS_DEV_MODE) {
+        res.status(403).json({ ok: false, message: 'Disabled in production' });
+        return;
+    }
+
+    const payload = req.method === 'POST' ? (req.body || {}) : {};
+    const roomCode = String(req.query.roomCode || payload.roomCode || '').trim();
+    let playerKey = String(req.query.playerKey || payload.playerKey || payload.playerId || '').trim();
+    const reason = String(req.query.reason || payload.reason || 'simulated_suspicion').trim();
+    const countRaw = Number(req.query.count || payload.count || 1);
+    const count = Number.isFinite(countRaw) ? countRaw : 1;
+
+    if (!roomCode) {
+        res.status(400).json({
+            ok: false,
+            message: 'roomCode is required',
+            usage: '/admin/simulate-suspicion?roomCode=12345&playerKey=<playerId|persistentId|name>&reason=test&count=3'
+        });
+        return;
+    }
+    if (!playerKey && rooms[roomCode]) {
+        const keys = Object.keys(rooms[roomCode].players || {});
+        if (keys.length === 1) playerKey = keys[0];
+    }
+    if (!playerKey) {
+        res.status(400).json({
+            ok: false,
+            message: 'playerKey is required when room has multiple players',
+            usage: '/admin/simulate-suspicion?roomCode=12345&playerKey=<playerId|persistentId|name>&reason=test&count=3'
+        });
+        return;
+    }
+
+    const result = applySimulatedSuspicion(roomCode, playerKey, reason, count);
+    if (!result.ok) {
+        res.status(404).json(result);
+        return;
+    }
+    res.json(result);
+});
+
+app.get('/admin/logs', (req, res) => {
+    const prettyParam = String(req.query.pretty || '').toLowerCase();
+    const prettyJson = prettyParam === '1' || prettyParam === 'true' || prettyParam === 'yes';
+    const format = String(req.query.format || 'json').toLowerCase();
+    const typeRaw = String(req.query.type || 'all').toLowerCase().trim();
+    const type = ['recent', 'escalations', 'snapshots', 'all'].includes(typeRaw) ? typeRaw : 'all';
+    const limitRaw = Number(req.query.limit);
+    const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(500, Math.floor(limitRaw))) : 100;
+    const fromTsRaw = Number(req.query.fromTs);
+    const toTsRaw = Number(req.query.toTs);
+    const fromTs = Number.isFinite(fromTsRaw) ? fromTsRaw : null;
+    const toTs = Number.isFinite(toTsRaw) ? toTsRaw : null;
+    const filterRoomCode = typeof req.query.roomCode === 'string' ? req.query.roomCode.trim() : '';
+    const filterPlayerKey = typeof req.query.playerKey === 'string' ? req.query.playerKey.trim() : '';
+    const filterReason = typeof req.query.reason === 'string' ? req.query.reason.trim() : '';
+
+    const accept = (e) => {
+        if (!e || typeof e.ts !== 'number') return false;
+        if (fromTs !== null && e.ts < fromTs) return false;
+        if (toTs !== null && e.ts > toTs) return false;
+        if (filterRoomCode && (e.room || e.roomCode || '') !== filterRoomCode) return false;
+        if (filterPlayerKey) {
+            const byPlayer =
+                (e.playerId || '') === filterPlayerKey ||
+                (e.socketId || '') === filterPlayerKey ||
+                (e.playerKey || '') === filterPlayerKey ||
+                (e.persistentId || '') === filterPlayerKey;
+            if (!byPlayer) return false;
+        }
+        if (filterReason && (e.reason || '') !== filterReason) return false;
+        return true;
+    };
+
+    const payload = { ok: true, mode: ANTI_CHEAT_MODE, filters: {
+        type, limit, fromTs, toTs, roomCode: filterRoomCode || null, playerKey: filterPlayerKey || null, reason: filterReason || null
+    } };
+
+    if (type === 'recent' || type === 'all') payload.recent = readJsonl(ANTI_CHEAT_RECENT_FILE, limit, accept).reverse();
+    if (type === 'escalations' || type === 'all') payload.escalations = readJsonl(ANTI_CHEAT_ESCALATIONS_FILE, limit, accept).reverse();
+    if (type === 'snapshots' || type === 'all') payload.snapshots = readJsonl(ANTI_CHEAT_SNAPSHOTS_FILE, limit, accept).reverse();
+
+    if (format === 'csv') {
+        const rows = [];
+        const pushRows = (kind, list) => {
+            (list || []).forEach((e) => {
+                rows.push({
+                    type: kind,
+                    ts: e.ts || '',
+                    room: e.room || e.roomCode || '',
+                    playerId: e.playerId || '',
+                    socketId: e.socketId || '',
+                    name: e.name || '',
+                    reason: e.reason || '',
+                    action: e.action || '',
+                    details: e.details ? JSON.stringify(e.details) : ''
+                });
+            });
+        };
+        pushRows('recent', payload.recent);
+        pushRows('escalation', payload.escalations);
+        pushRows('snapshot', payload.snapshots);
+        const head = ['type', 'ts', 'room', 'playerId', 'socketId', 'name', 'reason', 'action', 'details'];
+        const esc = (v) => `"${String(v === undefined || v === null ? '' : v).replace(/"/g, '""')}"`;
+        const csv = [head.join(',')]
+            .concat(rows.map((r) => head.map((h) => esc(r[h])).join(',')))
+            .join('\n');
+        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+        res.setHeader('Content-Disposition', 'attachment; filename="anti-cheat-logs.csv"');
+        res.send(csv);
+        return;
+    }
+
+    if (prettyJson) {
+        res.type('application/json').send(JSON.stringify(payload, null, 2));
+        return;
+    }
+    res.json(payload);
+});
+
+app.get('/admin/stats', (req, res) => {
+    const now = Date.now();
+    const prettyParam = String(req.query.pretty || '').toLowerCase();
+    const prettyJson = prettyParam === '1' || prettyParam === 'true' || prettyParam === 'yes';
+    const recentWindowSecRaw = Number(req.query.recentWindowSec);
+    const recentWindowSec = Number.isFinite(recentWindowSecRaw)
+        ? Math.max(10, Math.min(3600, Math.floor(recentWindowSecRaw)))
+        : 120;
+    const recentLimitRaw = Number(req.query.recentLimit);
+    const recentLimit = Number.isFinite(recentLimitRaw)
+        ? Math.max(1, Math.min(200, Math.floor(recentLimitRaw)))
+        : 50;
+    const filterRoomCode = typeof req.query.roomCode === 'string' ? req.query.roomCode.trim() : '';
+    const filterPlayerKey = typeof req.query.playerKey === 'string' ? req.query.playerKey.trim() : '';
+    const filterReason = typeof req.query.reason === 'string' ? req.query.reason.trim() : '';
+
+    const recentCutoff = now - (recentWindowSec * 1000);
+    const recentFiltered = antiCheatMetrics.recent
+        .filter((e) => {
+            if (!e || typeof e.ts !== 'number') return false;
+            if (e.ts < recentCutoff) return false;
+            if (filterRoomCode && (e.room || '') !== filterRoomCode) return false;
+            if (filterPlayerKey && (e.playerId || '') !== filterPlayerKey && (e.socketId || '') !== filterPlayerKey) return false;
+            if (filterReason && (e.reason || '') !== filterReason) return false;
+            return true;
+        })
+        .sort((a, b) => b.ts - a.ts)
+        .slice(0, recentLimit);
+
+    const roomEntries = Object.entries(rooms);
+    const activeRooms = roomEntries.length;
+    const liveRooms = roomEntries.filter(([, room]) => room && room.state === 'playing').length;
+    const connectedSockets = io.engine && typeof io.engine.clientsCount === 'number' ? io.engine.clientsCount : 0;
+    const playersInRooms = roomEntries.reduce((sum, [, room]) => sum + Object.keys(room.players || {}).length, 0);
+    const roomSummaries = buildRoomSnapshot(now);
+    const topPlayers = Object.values(antiCheatMetrics.players)
+        .sort((a, b) => b.strikes - a.strikes)
+        .slice(0, 15);
+    const topReasons = Object.entries(antiCheatMetrics.reasons)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, MAX_ANTI_CHEAT_REASON_SAMPLE)
+        .map(([reason, count]) => ({ reason, count }));
+
+    const payload = {
+        uptimeSec: Math.floor((Date.now() - antiCheatMetrics.startedAt) / 1000),
+        serverTime: Date.now(),
+        connectedSockets,
+        activeRooms,
+        liveRooms,
+        playersInRooms,
+        antiCheat: {
+            mode: ANTI_CHEAT_MODE,
+            config: {
+                strikeWindowMs: STRIKE_WINDOW_MS,
+                warnThreshold: STRIKE_WARN_THRESHOLD,
+                softThreshold: STRIKE_SOFT_BLOCK_THRESHOLD,
+                hardThreshold: STRIKE_HARD_BLOCK_THRESHOLD,
+                softBlockMs: SOFT_BLOCK_MS,
+                hardBlockMs: HARD_BLOCK_MS
+            },
+            totalSuspiciousEvents: antiCheatMetrics.totalSuspiciousEvents,
+            suspiciousEventsPerMinute: antiCheatMetrics.timeline.length,
+            enforcement: antiCheatMetrics.enforcements,
+            topReasons,
+            topPlayers,
+            recent: recentFiltered,
+            recentEscalations: antiCheatMetrics.escalations.slice(-50).reverse(),
+            recentFilters: {
+                recentWindowSec,
+                recentLimit,
+                roomCode: filterRoomCode || null,
+                playerKey: filterPlayerKey || null,
+                reason: filterReason || null
+            }
+        },
+        rooms: roomSummaries
+    };
+    if (prettyJson) {
+        res.type('application/json').send(JSON.stringify(payload, null, 2));
+        return;
+    }
+    res.json(payload);
+});
+
+app.get('/admin/dashboard', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'admin-dashboard.html'));
+});
+
 // ==================== START SERVER ====================
+ensureDataDir();
+setInterval(() => {
+    appendAntiCheatSnapshot(Date.now());
+}, 10000);
+
 server.listen(PORT, () => {
     console.log(`
 ╔═══════════════════════════════════════╗
@@ -1378,4 +2623,9 @@ process.on('SIGINT', () => {
         process.exit(0);
     });
 });
+
+
+
+
+
 

@@ -1,0 +1,397 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HeadShooter Admin Dashboard</title>
+  <style>
+    :root {
+      --bg: #0a0f1a;
+      --panel: #111a2a;
+      --panel-2: #16233a;
+      --text: #e5ecff;
+      --muted: #8fa4d8;
+      --ok: #22c55e;
+      --warn: #f59e0b;
+      --bad: #ef4444;
+      --line: #223354;
+      --btn: #3b82f6;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 16px;
+      font-family: "Segoe UI", Tahoma, sans-serif;
+      color: var(--text);
+      background: radial-gradient(circle at top, #142241, var(--bg) 55%);
+    }
+    h1 { margin: 0 0 12px; font-size: 24px; }
+    .controls, .grid, .panel { margin-bottom: 12px; }
+    .controls, .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 12px;
+    }
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+    input, select, button {
+      background: var(--panel-2);
+      color: var(--text);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 8px 10px;
+      font-size: 13px;
+    }
+    button {
+      background: var(--btn);
+      border: 0;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .grid {
+      display: grid;
+      gap: 12px;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    }
+    .kpi {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 12px;
+    }
+    .kpi .label { color: var(--muted); font-size: 12px; }
+    .kpi .value { font-size: 24px; font-weight: 800; margin-top: 4px; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; }
+    .tag { padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; }
+    .tag.ok { background: rgba(34,197,94,.2); color: #86efac; }
+    .tag.warn { background: rgba(245,158,11,.2); color: #fcd34d; }
+    .tag.bad { background: rgba(239,68,68,.2); color: #fca5a5; }
+    pre {
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-size: 12px;
+      line-height: 1.45;
+      color: #dbe7ff;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+    th, td {
+      padding: 6px 8px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+    th { color: var(--muted); font-weight: 700; }
+    .mono { font-family: Consolas, "Courier New", monospace; }
+    #trendCanvas {
+      width: 100%;
+      height: 110px;
+      background: #0b1321;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+  </style>
+</head>
+<body>
+  <h1>HeadShooter Admin Dashboard</h1>
+
+  <div class="controls">
+    <label>Auto refresh(ms)</label>
+    <input id="refreshMs" type="number" min="500" step="500" value="2000">
+    <label>Room</label>
+    <input id="roomCode" placeholder="optional room code">
+    <label>Player</label>
+    <input id="playerKey" placeholder="optional player id/key">
+    <label>Reason</label>
+    <input id="reason" placeholder="optional reason">
+    <button id="applyBtn">Apply</button>
+    <button id="reloadBtn">Reload now</button>
+    <button id="exportRecentBtn">Export Recent CSV</button>
+    <button id="exportEscBtn">Export Escalations CSV</button>
+  </div>
+
+  <div class="grid">
+    <div class="kpi"><div class="label">Mode</div><div id="mode" class="value">-</div></div>
+    <div class="kpi"><div class="label">Connected Sockets</div><div id="connected" class="value">-</div></div>
+    <div class="kpi"><div class="label">Live Rooms</div><div id="liveRooms" class="value">-</div></div>
+    <div class="kpi"><div class="label">Suspicious / Min</div><div id="spm" class="value">-</div></div>
+    <div class="kpi"><div class="label">Total Suspicious</div><div id="totalSus" class="value">-</div></div>
+  </div>
+
+  <div class="panel">
+    <div class="row">
+      <strong>Enforcement counters</strong>
+      <span id="warnCount" class="tag warn">warn: 0</span>
+      <span id="softCount" class="tag warn">soft: 0</span>
+      <span id="hardCount" class="tag bad">hard: 0</span>
+      <span id="wouldSoftCount" class="tag warn">wouldSoft: 0</span>
+      <span id="wouldHardCount" class="tag bad">wouldHard: 0</span>
+      <span id="blockedCount" class="tag bad">blockedEvents: 0</span>
+    </div>
+    <div class="row" style="margin-top:8px;">
+      <span id="cfgTag" class="tag ok">config: -</span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <strong>Events / Minute Trend</strong>
+    <canvas id="trendCanvas" width="1200" height="110"></canvas>
+  </div>
+
+  <div class="panel">
+    <strong>Room Summaries</strong>
+    <table>
+      <thead>
+        <tr><th>Room</th><th>State</th><th>Players</th><th>Events</th><th>Score</th><th>Blocked</th><th>Top Suspects</th></tr>
+      </thead>
+      <tbody id="roomsTable"></tbody>
+    </table>
+    <pre id="roomsOut">loading...</pre>
+  </div>
+
+  <div class="panel">
+    <strong>Top Reasons / Top Players</strong>
+    <table>
+      <thead>
+        <tr><th>Top Reasons</th><th>Top Players</th></tr>
+      </thead>
+      <tbody id="topsTable"></tbody>
+    </table>
+  </div>
+
+  <div class="panel">
+    <strong>Recent Escalations</strong>
+    <table>
+      <thead>
+        <tr><th>Time</th><th>Action</th><th>Player</th><th>Room</th><th>Details</th></tr>
+      </thead>
+      <tbody id="escalationsTable"></tbody>
+    </table>
+  </div>
+
+  <div class="panel">
+    <strong>Recent (filtered)</strong>
+    <table>
+      <thead>
+        <tr><th>Time</th><th>Reason</th><th>Player</th><th>Room</th><th>Details</th></tr>
+      </thead>
+      <tbody id="recentTable"></tbody>
+    </table>
+    <pre id="recentOut">loading...</pre>
+  </div>
+
+  <script>
+    var timer = null;
+    var filters = { roomCode: '', playerKey: '', reason: '' };
+    var trendData = [];
+    var lastPayload = null;
+
+    function val(id) { return document.getElementById(id).value || ''; }
+    function txt(id, value) { document.getElementById(id).textContent = value; }
+    function pretty(v) { return JSON.stringify(v, null, 2); }
+    function esc(s) {
+      return String(s === undefined || s === null ? '' : s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+    }
+    function fmtTs(ts) {
+      if (!ts) return '-';
+      var d = new Date(ts);
+      return d.toLocaleTimeString();
+    }
+
+    function buildStatsUrl() {
+      var q = [];
+      q.push('pretty=1');
+      q.push('recentLimit=25');
+      q.push('recentWindowSec=300');
+      if (filters.roomCode) q.push('roomCode=' + encodeURIComponent(filters.roomCode));
+      if (filters.playerKey) q.push('playerKey=' + encodeURIComponent(filters.playerKey));
+      if (filters.reason) q.push('reason=' + encodeURIComponent(filters.reason));
+      return '/admin/stats?' + q.join('&');
+    }
+
+    function buildLogsUrl(type) {
+      var q = [];
+      q.push('pretty=1');
+      q.push('type=' + encodeURIComponent(type || 'all'));
+      q.push('limit=50');
+      if (filters.roomCode) q.push('roomCode=' + encodeURIComponent(filters.roomCode));
+      if (filters.playerKey) q.push('playerKey=' + encodeURIComponent(filters.playerKey));
+      if (filters.reason) q.push('reason=' + encodeURIComponent(filters.reason));
+      return '/admin/logs?' + q.join('&');
+    }
+
+    function drawTrend() {
+      var c = document.getElementById('trendCanvas');
+      var ctx = c.getContext('2d');
+      var w = c.width, h = c.height;
+      ctx.clearRect(0, 0, w, h);
+      ctx.fillStyle = '#0b1321';
+      ctx.fillRect(0, 0, w, h);
+      if (!trendData.length) return;
+      var max = 1;
+      for (var i = 0; i < trendData.length; i++) max = Math.max(max, trendData[i]);
+      ctx.strokeStyle = '#294165';
+      ctx.beginPath();
+      ctx.moveTo(0, h - 0.5);
+      ctx.lineTo(w, h - 0.5);
+      ctx.stroke();
+      ctx.strokeStyle = '#60a5fa';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      for (var j = 0; j < trendData.length; j++) {
+        var x = (j / Math.max(1, trendData.length - 1)) * w;
+        var y = h - ((trendData[j] / max) * (h - 8)) - 4;
+        if (j === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+    }
+
+    function renderRooms(rooms) {
+      var tb = document.getElementById('roomsTable');
+      var html = '';
+      (rooms || []).forEach(function(r) {
+        var suspects = ((r.topRoomSuspects || []).map(function(x){ return esc(x.playerKey) + ':' + x.score; }).join('<br>')) || '-';
+        html += '<tr>'
+          + '<td class="mono">' + esc(r.roomCode) + '</td>'
+          + '<td>' + esc(r.state) + '</td>'
+          + '<td>' + esc(r.players) + '</td>'
+          + '<td>' + esc(r.antiCheatEvents) + '</td>'
+          + '<td>' + esc(r.antiCheatScore) + '</td>'
+          + '<td>' + esc(r.blockedNow) + '</td>'
+          + '<td class="mono">' + suspects + '</td>'
+          + '</tr>';
+      });
+      tb.innerHTML = html || '<tr><td colspan="7">No rooms</td></tr>';
+    }
+
+    function renderTops(anti) {
+      var reasons = anti.topReasons || [];
+      var players = anti.topPlayers || [];
+      var maxRows = Math.max(reasons.length, players.length, 1);
+      var html = '';
+      for (var i = 0; i < maxRows; i++) {
+        var r = reasons[i];
+        var p = players[i];
+        html += '<tr>'
+          + '<td class="mono">' + (r ? esc(r.reason) + ' (' + esc(r.count) + ')' : '-') + '</td>'
+          + '<td class="mono">' + (p ? esc(p.name) + ' / ' + esc(p.strikes) : '-') + '</td>'
+          + '</tr>';
+      }
+      document.getElementById('topsTable').innerHTML = html;
+    }
+
+    function renderRecentRows(list) {
+      var html = '';
+      (list || []).forEach(function(e) {
+        html += '<tr>'
+          + '<td>' + esc(fmtTs(e.ts)) + '</td>'
+          + '<td class="mono">' + esc(e.reason || '-') + '</td>'
+          + '<td>' + esc(e.name || e.playerId || '-') + '</td>'
+          + '<td class="mono">' + esc(e.room || e.roomCode || '-') + '</td>'
+          + '<td class="mono">' + esc(e.details ? JSON.stringify(e.details) : '-') + '</td>'
+          + '</tr>';
+      });
+      document.getElementById('recentTable').innerHTML = html || '<tr><td colspan="5">No events</td></tr>';
+    }
+
+    function renderEscRows(list) {
+      var html = '';
+      (list || []).forEach(function(e) {
+        html += '<tr>'
+          + '<td>' + esc(fmtTs(e.ts)) + '</td>'
+          + '<td class="mono">' + esc(e.action || '-') + '</td>'
+          + '<td>' + esc(e.name || e.playerId || '-') + '</td>'
+          + '<td class="mono">' + esc(e.room || '-') + '</td>'
+          + '<td class="mono">' + esc(e.details ? JSON.stringify(e.details) : '-') + '</td>'
+          + '</tr>';
+      });
+      document.getElementById('escalationsTable').innerHTML = html || '<tr><td colspan="5">No escalations</td></tr>';
+    }
+
+    async function reload() {
+      try {
+        var pair = await Promise.all([
+          fetch(buildStatsUrl(), { cache: 'no-store' }),
+          fetch(buildLogsUrl('escalations'), { cache: 'no-store' })
+        ]);
+        if (!pair[0].ok) throw new Error('HTTP ' + pair[0].status);
+        if (!pair[1].ok) throw new Error('HTTP ' + pair[1].status);
+        var data = await pair[0].json();
+        var logs = await pair[1].json();
+        var anti = data.antiCheat || {};
+        var enf = anti.enforcement || {};
+        lastPayload = { stats: data, logs: logs };
+
+        txt('mode', anti.mode || '-');
+        txt('connected', String(data.connectedSockets || 0));
+        txt('liveRooms', String(data.liveRooms || 0));
+        txt('spm', String(anti.suspiciousEventsPerMinute || 0));
+        txt('totalSus', String(anti.totalSuspiciousEvents || 0));
+
+        txt('warnCount', 'warn: ' + (enf.warn || 0));
+        txt('softCount', 'soft: ' + (enf.softBlock || 0));
+        txt('hardCount', 'hard: ' + (enf.hardBlock || 0));
+        txt('wouldSoftCount', 'wouldSoft: ' + (enf.wouldSoftBlock || 0));
+        txt('wouldHardCount', 'wouldHard: ' + (enf.wouldHardBlock || 0));
+        txt('blockedCount', 'blockedEvents: ' + (enf.blockedEvents || 0));
+        var cfg = anti.config || {};
+        txt('cfgTag', 'config: warn=' + (cfg.warnThreshold || '-') + ' soft=' + (cfg.softThreshold || '-') + ' hard=' + (cfg.hardThreshold || '-'));
+
+        trendData.push(Number(anti.suspiciousEventsPerMinute || 0));
+        if (trendData.length > 120) trendData.shift();
+        drawTrend();
+
+        renderRooms(data.rooms || []);
+        renderTops(anti);
+        renderRecentRows(anti.recent || []);
+        renderEscRows(logs.escalations || []);
+
+        txt('roomsOut', pretty(data.rooms || []));
+        txt('recentOut', pretty(anti.recent || []));
+      } catch (e) {
+        txt('roomsOut', 'Failed to load stats: ' + e.message);
+      }
+    }
+
+    function resetTimer() {
+      if (timer) clearInterval(timer);
+      var ms = Number(val('refreshMs')) || 2000;
+      ms = Math.max(500, ms);
+      timer = setInterval(reload, ms);
+    }
+
+    document.getElementById('applyBtn').addEventListener('click', function() {
+      filters.roomCode = val('roomCode').trim();
+      filters.playerKey = val('playerKey').trim();
+      filters.reason = val('reason').trim();
+      resetTimer();
+      reload();
+    });
+    document.getElementById('reloadBtn').addEventListener('click', reload);
+    document.getElementById('exportRecentBtn').addEventListener('click', function() {
+      window.location.href = buildLogsUrl('recent').replace('pretty=1', 'format=csv');
+    });
+    document.getElementById('exportEscBtn').addEventListener('click', function() {
+      window.location.href = buildLogsUrl('escalations').replace('pretty=1', 'format=csv');
+    });
+    document.getElementById('refreshMs').addEventListener('change', function() {
+      resetTimer();
+    });
+
+    resetTimer();
+    reload();
+  </script>
+</body>
+</html>
