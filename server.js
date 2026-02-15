@@ -15,7 +15,10 @@ const io = socketIO(server, {
     cors: {
         origin: "*",
         methods: ["GET", "POST"]
-    }
+    },
+    transports: ['websocket', 'polling'],
+    perMessageDeflate: false,
+    httpCompression: false
 });
 
 const PORT = process.env.PORT || 3000;
@@ -40,7 +43,7 @@ const ANTI_CHEAT_SNAPSHOTS_FILE = path.join(DATA_DIR, 'anti-cheat-room-snapshots
 // ==================== GAME CONSTANTS ====================
 const MAP_WIDTH = 3000;
 const MAP_HEIGHT = 2000;
-const TICK_RATE = 30;
+const TICK_RATE = envInt('TICK_RATE', 45, 20, 60);
 const TICK_MS = 1000 / TICK_RATE;
 const BASE_SPEED_PER_SEC = 127.05; // 2.1175 * 60fps
 const MAX_PLAYERS_PER_ROOM = 6;
@@ -2398,7 +2401,7 @@ setInterval(() => {
             }
         }
     });
-}, TICK_MS); // 30 ticks/sec
+}, TICK_MS); // authoritative simulation tick rate
 
 // ==================== SERVE CLIENT ====================
 app.use(express.static(path.join(__dirname, 'public')));
@@ -2640,8 +2643,6 @@ process.on('SIGINT', () => {
         process.exit(0);
     });
 });
-
-
 
 
 
