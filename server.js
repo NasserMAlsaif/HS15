@@ -860,6 +860,39 @@ function startGame(roomCode) {
 
 
 // ==================== GAME LOGIC ====================
+function respawnRoomPlayer(roomCode, player) {
+    const room = rooms[roomCode];
+    if (!room || !player) return false;
+    if (player.hp > 0) return false;
+
+    const spawn = getNextSpawn(roomCode);
+    player.x = spawn.x;
+    player.y = spawn.y;
+    player.maxHp = 3; // Reset Extra Core on death
+    player.hp = player.maxHp;
+    player.hasShield = false;
+    player.shieldExpire = 0;
+    player.invisible = false;
+    player.invisExpire = 0;
+    player.speedBoost = false;
+    player.speedExpire = 0;
+    player.charging = false;
+    player.chargeStartedAt = 0;
+    player.lastShotAt = 0;
+    player.inputSeq = 0;
+    player.input = { w: false, a: false, s: false, d: false, angle: player.angle || 0, charging: false, seq: 0 };
+    player.inputIntegrity = { lastMask: 0, lastAt: 0, togglePoints: 0, windowStart: 0 };
+    player.diedAt = 0;
+
+    io.to(roomCode).emit('playerRespawn', {
+        playerId: player.id,
+        x: spawn.x,
+        y: spawn.y,
+        hp: player.hp
+    });
+    return true;
+}
+
 function updatePlayers(roomCode, dt) {
     const room = rooms[roomCode];
     if (!room || room.state !== 'playing') return;
@@ -868,7 +901,12 @@ function updatePlayers(roomCode, dt) {
     const mapKey = room.selectedMap || room.map || 'forest';
 
     Object.values(room.players).forEach(player => {
-        if (player.hp <= 0) return;
+        if (player.hp <= 0) {
+            if (player.diedAt && (now - player.diedAt) >= PLAYER_RESPAWN_DELAY) {
+                respawnRoomPlayer(roomCode, player);
+            }
+            return;
+        }
 
         // Expire timed buffs
         if (player.hasShield && player.shieldExpire && now > player.shieldExpire) player.hasShield = false;
@@ -994,6 +1032,7 @@ function handleKill(roomCode, killerId, victimId, isHeadshot) {
     
     const killer = room.players[killerId];
     const victim = room.players[victimId];
+    const now = Date.now();
     
     if (!killer || !victim) return;
     
@@ -1013,9 +1052,9 @@ function handleKill(roomCode, killerId, victimId, isHeadshot) {
     victim.charging = false;
     victim.chargeStartedAt = 0;
     victim.lastShotAt = 0;
+    victim.diedAt = now;
     
     // Kill chain tracking
-    const now = Date.now();
     if (!room.killChains[killerId]) {
         room.killChains[killerId] = { count: 0, lastKillTime: 0 };
     }
@@ -1056,30 +1095,7 @@ function handleKill(roomCode, killerId, victimId, isHeadshot) {
         }
         if (!victimRef) return;
 
-        const spawn = getNextSpawn(roomCode);
-        victimRef.x = spawn.x;
-        victimRef.y = spawn.y;
-        victimRef.maxHp = 3; // Reset Extra Core on death
-        victimRef.hp = victimRef.maxHp;
-        victimRef.hasShield = false;
-        victimRef.shieldExpire = 0;
-        victimRef.invisible = false;
-        victimRef.invisExpire = 0;
-        victimRef.speedBoost = false;
-        victimRef.speedExpire = 0;
-        victimRef.charging = false;
-        victimRef.chargeStartedAt = 0;
-        victimRef.lastShotAt = 0;
-        victimRef.inputSeq = 0;
-        victimRef.input = { w: false, a: false, s: false, d: false, angle: victimRef.angle || 0, charging: false, seq: 0 };
-        victimRef.inputIntegrity = { lastMask: 0, lastAt: 0, togglePoints: 0, windowStart: 0 };
-
-        io.to(roomCode).emit('playerRespawn', {
-            playerId: victimRef.id || victimId,
-            x: spawn.x,
-            y: spawn.y,
-            hp: victimRef.hp
-        });
+        respawnRoomPlayer(roomCode, victimRef);
     }, PLAYER_RESPAWN_DELAY);
     
     // Broadcast kill
@@ -1177,6 +1193,7 @@ function makePlayer(socketId, playerName, persistentId, isLeader) {
         charging: false,
         chargeStartedAt: 0,
         lastShotAt: 0,
+        diedAt: 0,
         inputSeq: 0,
         antiCheatStrikes: 0,
         antiCheatState: {
@@ -2018,6 +2035,7 @@ io.on('connection', (socket) => {
             player.charging = false;
             player.chargeStartedAt = 0;
             player.lastShotAt = 0;
+            player.diedAt = 0;
             player.inputSeq = 0;
             player.antiCheatStrikes = 0;
             player.antiCheatState = {
