@@ -35,7 +35,8 @@ function envInt(name, fallback, min, max) {
 const ANTI_CHEAT_MODE = String(process.env.ANTI_CHEAT_MODE || 'observe').toLowerCase() === 'enforce'
     ? 'enforce'
     : 'observe';
-const ANTI_CHEAT_PENALTIES_ENABLED = String(process.env.ANTI_CHEAT_PENALTIES_ENABLED || '0').toLowerCase() === '1';
+// Keep anti-cheat telemetry/logging enabled, but disable in-match penalties for now.
+const ANTI_CHEAT_PENALTIES_ENABLED = false;
 const DATA_DIR = path.join(__dirname, 'data');
 const ANTI_CHEAT_RECENT_FILE = path.join(DATA_DIR, 'anti-cheat-recent.jsonl');
 const ANTI_CHEAT_ESCALATIONS_FILE = path.join(DATA_DIR, 'anti-cheat-escalations.jsonl');
@@ -1399,13 +1400,15 @@ io.on('connection', (socket) => {
             st.lastActionAt = now;
             antiCheatMetrics.enforcements[action] = (antiCheatMetrics.enforcements[action] || 0) + 1;
             pushEscalation(player, action, now, actionDetails);
-            socket.emit('antiCheatAction', {
-                action,
-                until: actionDetails && actionDetails.until ? actionDetails.until : (st.blockUntil || 0),
-                windowStrikes: st.windowStrikes,
-                mode: actionDetails && actionDetails.mode ? actionDetails.mode : (enforce ? 'enforce' : 'observe'),
-                enforced: !!(actionDetails && actionDetails.enforced)
-            });
+            if (enforce) {
+                socket.emit('antiCheatAction', {
+                    action,
+                    until: actionDetails && actionDetails.until ? actionDetails.until : (st.blockUntil || 0),
+                    windowStrikes: st.windowStrikes,
+                    mode: actionDetails && actionDetails.mode ? actionDetails.mode : (enforce ? 'enforce' : 'observe'),
+                    enforced: !!(actionDetails && actionDetails.enforced)
+                });
+            }
         }
     }
 
@@ -2665,4 +2668,3 @@ process.on('SIGINT', () => {
         process.exit(0);
     });
 });
-
