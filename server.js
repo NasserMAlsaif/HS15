@@ -61,6 +61,8 @@ const FAST_CHARGE_REQUIRED_MS = 850;
 const CHARGE_VALIDATION_GRACE_MS = 90;
 const SHOT_ORIGIN_TOLERANCE = 6;
 const SHOT_PATH_SAMPLE_STEP = 6;
+const PROJECTILE_HIT_RADIUS = 21;
+const PROJECTILE_HEADSHOT_RADIUS = 14;
 const MAX_ACTIVE_PROJECTILES_PER_PLAYER = 8;
 const MAX_INPUT_AHEAD_SEQ = 200;
 const MAX_INPUT_STALE_MS = 4000;
@@ -813,6 +815,23 @@ function isShotPathBlocked(mapKey, fromX, fromY, toX, toY) {
     return false;
 }
 
+function closestPointOnSegment(ax, ay, bx, by, px, py) {
+    const abx = bx - ax;
+    const aby = by - ay;
+    const abLenSq = (abx * abx) + (aby * aby);
+    if (abLenSq <= 1e-6) {
+        return { x: ax, y: ay, t: 0 };
+    }
+    let t = (((px - ax) * abx) + ((py - ay) * aby)) / abLenSq;
+    if (t < 0) t = 0;
+    if (t > 1) t = 1;
+    return {
+        x: ax + (abx * t),
+        y: ay + (aby * t),
+        t
+    };
+}
+
 function startGame(roomCode) {
     const room = rooms[roomCode];
     if (!room || room.state !== 'lobby') return false;
@@ -955,12 +974,13 @@ function updatePlayers(roomCode, dt) {
 function updateProjectiles(roomCode, dt) {
     const room = rooms[roomCode];
     if (!room || room.state !== 'playing') return;
-    
-    const now = Date.now();
+
     const validProjectiles = [];
     const mapKey = room.selectedMap || room.map || 'forest';
     
     room.projectiles.forEach(proj => {
+        const prevX = proj.x;
+        const prevY = proj.y;
         proj.x += proj.vx * dt;
         proj.y += proj.vy * dt;
         proj.life = (proj.life || 0) + dt;
@@ -981,47 +1001,50 @@ function updateProjectiles(roomCode, dt) {
         }
 
         // Check player collisions
-        let hit = false;
-        Object.values(room.players).forEach(player => {
-            if (player.hp <= 0 || player.id === proj.ownerId) return;
-            
-            const dx = proj.x - player.x;
-            const dy = proj.y - player.y;
-            const dist = Math.sqrt(dx * dx + dy * dy);
-            
-            if (dist < 21) { // Hit radius
-                const isHeadshot = dist < 13;
-                const blockedByShield = !!player.hasShield;
-                const headshot = !blockedByShield && isHeadshot;
-                const hitType = blockedByShield ? 'shield' : 'player';
+        let bestHit = null;
+        for (const player of Object.values(room.players)) {
+            if (player.hp <= 0 || player.id === proj.ownerId) continue;
 
-                io.to(roomCode).emit('hitEffect', {
-                    x: proj.x,
-                    y: proj.y,
-                    type: hitType,
-                    headshot: headshot,
-                    victimId: player.id,
-                    ownerId: proj.ownerId
-                });
-                console.log('[srv] hitEffect', roomCode, hitType, 'headshot=', headshot, 'owner=', proj.ownerId, 'victim=', player.id);
-                
-                // Handle damage (shield blocks exactly one hit, even headshots)
-                if (blockedByShield) {
-                    player.hasShield = false;
-                    io.to(roomCode).emit('shieldBreak', { playerId: player.id });
-                } else {
-                    player.hp = headshot ? 0 : player.hp - 1;
-                    
-                    if (player.hp <= 0) {
-                        handleKill(roomCode, proj.ownerId, player.id, headshot);
-                    }
-                }
-                
-                hit = true;
+            const closest = closestPointOnSegment(prevX, prevY, proj.x, proj.y, player.x, player.y);
+            const dx = closest.x - player.x;
+            const dy = closest.y - player.y;
+            const distSq = (dx * dx) + (dy * dy);
+            if (distSq >= (PROJECTILE_HIT_RADIUS * PROJECTILE_HIT_RADIUS)) continue;
+
+            if (!bestHit || closest.t < bestHit.t || (closest.t === bestHit.t && distSq < bestHit.distSq)) {
+                bestHit = { player, closest, distSq, t: closest.t };
             }
-        });
+        }
         
-        if (!hit) {
+        if (bestHit) {
+            const victim = bestHit.player;
+            const dist = Math.sqrt(bestHit.distSq);
+            const isHeadshot = dist < PROJECTILE_HEADSHOT_RADIUS;
+            const blockedByShield = !!victim.hasShield;
+            const headshot = !blockedByShield && isHeadshot;
+            const hitType = blockedByShield ? 'shield' : 'player';
+
+            io.to(roomCode).emit('hitEffect', {
+                x: bestHit.closest.x,
+                y: bestHit.closest.y,
+                type: hitType,
+                headshot: headshot,
+                victimId: victim.id,
+                ownerId: proj.ownerId
+            });
+            console.log('[srv] hitEffect', roomCode, hitType, 'headshot=', headshot, 'owner=', proj.ownerId, 'victim=', victim.id);
+
+            // Shield blocks exactly one hit, even headshots.
+            if (blockedByShield) {
+                victim.hasShield = false;
+                io.to(roomCode).emit('shieldBreak', { playerId: victim.id });
+            } else {
+                victim.hp = headshot ? 0 : victim.hp - 1;
+                if (victim.hp <= 0) {
+                    handleKill(roomCode, proj.ownerId, victim.id, headshot);
+                }
+            }
+        } else {
             validProjectiles.push(proj);
         }
     });
