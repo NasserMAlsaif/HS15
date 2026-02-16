@@ -66,8 +66,8 @@ const PLAYER_HEAD_VISUAL_RADIUS = 8;
 const PROJECTILE_COLLISION_RADIUS = 3;
 const PROJECTILE_TIP_OFFSET = 6;
 const PROJECTILE_HIT_RADIUS = PLAYER_BODY_RADIUS + PROJECTILE_COLLISION_RADIUS; // 21
-// Headshot when projectile touches the small head circle (with tiny tolerance).
-const PROJECTILE_HEADSHOT_RADIUS = PLAYER_HEAD_VISUAL_RADIUS + PROJECTILE_COLLISION_RADIUS + 2; // 13
+// Headshot when projectile touches the small head circle (with extra tolerance for mobile/net jitter).
+const PROJECTILE_HEADSHOT_RADIUS = PLAYER_HEAD_VISUAL_RADIUS + PROJECTILE_COLLISION_RADIUS + 5; // 16
 const MAX_ACTIVE_PROJECTILES_PER_PLAYER = 8;
 const MAX_INPUT_AHEAD_SEQ = 200;
 const MAX_INPUT_STALE_MS = 4000;
@@ -1041,7 +1041,7 @@ function updateProjectiles(roomCode, dt) {
         if (bestHit) {
             const victim = bestHit.player;
             const dist = Math.sqrt(bestHit.distSq);
-            const isHeadshot = dist < PROJECTILE_HEADSHOT_RADIUS;
+            const isHeadshot = dist <= PROJECTILE_HEADSHOT_RADIUS;
             const blockedByShield = !!victim.hasShield;
             const headshot = !blockedByShield && isHeadshot;
             const hitType = blockedByShield ? 'shield' : 'player';
