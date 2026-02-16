@@ -865,6 +865,9 @@ function respawnRoomPlayer(roomCode, player) {
     if (!room || !player) return false;
     if (player.hp > 0) return false;
 
+    const carrySeq = Number.isFinite(player.inputSeq)
+        ? player.inputSeq
+        : ((player.input && Number.isFinite(player.input.seq)) ? player.input.seq : 0);
     const spawn = getNextSpawn(roomCode);
     player.x = spawn.x;
     player.y = spawn.y;
@@ -879,8 +882,8 @@ function respawnRoomPlayer(roomCode, player) {
     player.charging = false;
     player.chargeStartedAt = 0;
     player.lastShotAt = 0;
-    player.inputSeq = 0;
-    player.input = { w: false, a: false, s: false, d: false, angle: player.angle || 0, charging: false, seq: 0 };
+    player.inputSeq = carrySeq;
+    player.input = { w: false, a: false, s: false, d: false, angle: player.angle || 0, charging: false, seq: carrySeq };
     player.inputIntegrity = { lastMask: 0, lastAt: 0, togglePoints: 0, windowStart: 0 };
     player.diedAt = 0;
 
