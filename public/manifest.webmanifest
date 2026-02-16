@@ -4,7 +4,7 @@
   "description": "Online shooter by Nasser Lab",
   "start_url": "/",
   "scope": "/",
-  "display": "standalone",
+  "display": "fullscreen",
   "orientation": "landscape",
   "background_color": "#0b1020",
   "theme_color": "#0b1020",
