@@ -35,6 +35,7 @@ function envInt(name, fallback, min, max) {
 const ANTI_CHEAT_MODE = String(process.env.ANTI_CHEAT_MODE || 'observe').toLowerCase() === 'enforce'
     ? 'enforce'
     : 'observe';
+const ANTI_CHEAT_PENALTIES_ENABLED = String(process.env.ANTI_CHEAT_PENALTIES_ENABLED || '0').toLowerCase() === '1';
 const DATA_DIR = path.join(__dirname, 'data');
 const ANTI_CHEAT_RECENT_FILE = path.join(DATA_DIR, 'anti-cheat-recent.jsonl');
 const ANTI_CHEAT_ESCALATIONS_FILE = path.join(DATA_DIR, 'anti-cheat-escalations.jsonl');
@@ -1352,7 +1353,7 @@ io.on('connection', (socket) => {
         st.windowStrikes += 1;
         let action = null;
         let actionDetails = null;
-        const enforce = ANTI_CHEAT_MODE === 'enforce';
+        const enforce = ANTI_CHEAT_MODE === 'enforce' && ANTI_CHEAT_PENALTIES_ENABLED;
         let virtualUntil = 0;
 
         if (st.windowStrikes >= STRIKE_HARD_BLOCK_THRESHOLD) {
@@ -1364,7 +1365,13 @@ io.on('connection', (socket) => {
                 antiCheatMetrics.enforcements.wouldHardBlock = (antiCheatMetrics.enforcements.wouldHardBlock || 0) + 1;
             }
             action = 'hardBlock';
-            actionDetails = { reason, until: enforce ? (st.blockUntil || 0) : virtualUntil, windowStrikes: st.windowStrikes, mode: ANTI_CHEAT_MODE };
+            actionDetails = {
+                reason,
+                until: enforce ? (st.blockUntil || 0) : virtualUntil,
+                windowStrikes: st.windowStrikes,
+                mode: enforce ? 'enforce' : 'observe',
+                enforced: enforce
+            };
         } else if (st.windowStrikes >= STRIKE_SOFT_BLOCK_THRESHOLD) {
             if (st.level !== 'hard') st.level = 'soft';
             virtualUntil = now + SOFT_BLOCK_MS;
@@ -1374,11 +1381,17 @@ io.on('connection', (socket) => {
                 antiCheatMetrics.enforcements.wouldSoftBlock = (antiCheatMetrics.enforcements.wouldSoftBlock || 0) + 1;
             }
             action = 'softBlock';
-            actionDetails = { reason, until: enforce ? (st.blockUntil || 0) : virtualUntil, windowStrikes: st.windowStrikes, mode: ANTI_CHEAT_MODE };
+            actionDetails = {
+                reason,
+                until: enforce ? (st.blockUntil || 0) : virtualUntil,
+                windowStrikes: st.windowStrikes,
+                mode: enforce ? 'enforce' : 'observe',
+                enforced: enforce
+            };
         } else if (st.windowStrikes >= STRIKE_WARN_THRESHOLD && !st.warned) {
             st.warned = true;
             action = 'warn';
-            actionDetails = { reason, windowStrikes: st.windowStrikes, mode: ANTI_CHEAT_MODE };
+            actionDetails = { reason, windowStrikes: st.windowStrikes, mode: enforce ? 'enforce' : 'observe', enforced: false };
         }
 
         if (action) {
@@ -1390,13 +1403,14 @@ io.on('connection', (socket) => {
                 action,
                 until: actionDetails && actionDetails.until ? actionDetails.until : (st.blockUntil || 0),
                 windowStrikes: st.windowStrikes,
-                mode: ANTI_CHEAT_MODE
+                mode: actionDetails && actionDetails.mode ? actionDetails.mode : (enforce ? 'enforce' : 'observe'),
+                enforced: !!(actionDetails && actionDetails.enforced)
             });
         }
     }
 
     function isEnforcementBlocked(player, eventName) {
-        if (ANTI_CHEAT_MODE !== 'enforce') return false;
+        if (ANTI_CHEAT_MODE !== 'enforce' || !ANTI_CHEAT_PENALTIES_ENABLED) return false;
         const now = Date.now();
         const st = ensureAntiCheatState(player, now);
         if (!st.blockUntil || now >= st.blockUntil) return false;
@@ -1562,6 +1576,14 @@ io.on('connection', (socket) => {
         };
         player.inputIntegrity = { lastMask: 0, lastAt: 0, togglePoints: 0, windowStart: 0 };
         player.chargeStartedAt = 0;
+        if (player.antiCheatState) {
+            player.antiCheatState.windowStart = 0;
+            player.antiCheatState.windowStrikes = 0;
+            player.antiCheatState.level = 'none';
+            player.antiCheatState.warned = false;
+            player.antiCheatState.blockUntil = 0;
+            player.antiCheatState.lastBlockLogAt = 0;
+        }
     }
 
     function reconnectSocketToMatch(match, preferredName) {
@@ -2643,7 +2665,4 @@ process.on('SIGINT', () => {
         process.exit(0);
     });
 });
-
-
-
 
