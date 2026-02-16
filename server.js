@@ -64,9 +64,10 @@ const SHOT_PATH_SAMPLE_STEP = 6;
 const PLAYER_BODY_RADIUS = 18;
 const PLAYER_HEAD_VISUAL_RADIUS = 8;
 const PROJECTILE_COLLISION_RADIUS = 3;
+const PROJECTILE_TIP_OFFSET = 6;
 const PROJECTILE_HIT_RADIUS = PLAYER_BODY_RADIUS + PROJECTILE_COLLISION_RADIUS; // 21
 // Headshot when projectile touches the small head circle (with tiny tolerance).
-const PROJECTILE_HEADSHOT_RADIUS = PLAYER_HEAD_VISUAL_RADIUS + PROJECTILE_COLLISION_RADIUS + 1; // 12
+const PROJECTILE_HEADSHOT_RADIUS = PLAYER_HEAD_VISUAL_RADIUS + PROJECTILE_COLLISION_RADIUS + 2; // 13
 const MAX_ACTIVE_PROJECTILES_PER_PLAYER = 8;
 const MAX_INPUT_AHEAD_SEQ = 200;
 const MAX_INPUT_STALE_MS = 4000;
@@ -1005,11 +1006,28 @@ function updateProjectiles(roomCode, dt) {
         }
 
         // Check player collisions
+        let segStartX = prevX;
+        let segStartY = prevY;
+        let segEndX = proj.x;
+        let segEndY = proj.y;
+        const segDx = segEndX - segStartX;
+        const segDy = segEndY - segStartY;
+        const segLen = Math.sqrt((segDx * segDx) + (segDy * segDy));
+        if (segLen > 1e-6) {
+            const ux = segDx / segLen;
+            const uy = segDy / segLen;
+            // Use arrow tip for hit tests to match client visuals.
+            segStartX += ux * PROJECTILE_TIP_OFFSET;
+            segStartY += uy * PROJECTILE_TIP_OFFSET;
+            segEndX += ux * PROJECTILE_TIP_OFFSET;
+            segEndY += uy * PROJECTILE_TIP_OFFSET;
+        }
+
         let bestHit = null;
         for (const player of Object.values(room.players)) {
             if (player.hp <= 0 || player.id === proj.ownerId) continue;
 
-            const closest = closestPointOnSegment(prevX, prevY, proj.x, proj.y, player.x, player.y);
+            const closest = closestPointOnSegment(segStartX, segStartY, segEndX, segEndY, player.x, player.y);
             const dx = closest.x - player.x;
             const dy = closest.y - player.y;
             const distSq = (dx * dx) + (dy * dy);
