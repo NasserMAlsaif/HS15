@@ -1002,6 +1002,17 @@ function handleKill(roomCode, killerId, victimId, isHeadshot) {
     killer.killstreak++;
     victim.deaths++;
     victim.killstreak = 0;
+    victim.hp = 0;
+    // Death must clear temporary buffs/states to avoid hidden/stuck players after respawn.
+    victim.hasShield = false;
+    victim.shieldExpire = 0;
+    victim.invisible = false;
+    victim.invisExpire = 0;
+    victim.speedBoost = false;
+    victim.speedExpire = 0;
+    victim.charging = false;
+    victim.chargeStartedAt = 0;
+    victim.lastShotAt = 0;
     
     // Kill chain tracking
     const now = Date.now();
@@ -1035,26 +1046,40 @@ function handleKill(roomCode, killerId, victimId, isHeadshot) {
     
     // Schedule respawn
     setTimeout(() => {
-        if (rooms[roomCode] && rooms[roomCode].players[victimId]) {
-            const spawn = getNextSpawn(roomCode);
-            victim.x = spawn.x;
-            victim.y = spawn.y;
-            victim.hp = victim.maxHp;
-            victim.maxHp = 3; // Reset Extra Core
-            victim.charging = false;
-            victim.chargeStartedAt = 0;
-            victim.lastShotAt = 0;
-            victim.inputSeq = 0;
-            victim.input = { w: false, a: false, s: false, d: false, angle: victim.angle || 0, charging: false, seq: 0 };
-            victim.inputIntegrity = { lastMask: 0, lastAt: 0, togglePoints: 0, windowStart: 0 };
-            
-            io.to(roomCode).emit('playerRespawn', {
-                playerId: victimId,
-                x: spawn.x,
-                y: spawn.y,
-                hp: victim.hp
-            });
+        const roomNow = rooms[roomCode];
+        if (!roomNow) return;
+
+        let victimRef = roomNow.players[victimId];
+        if (!victimRef && victim.persistentId) {
+            const entry = Object.entries(roomNow.players || {}).find(([, p]) => p && p.persistentId === victim.persistentId);
+            if (entry) victimRef = entry[1];
         }
+        if (!victimRef) return;
+
+        const spawn = getNextSpawn(roomCode);
+        victimRef.x = spawn.x;
+        victimRef.y = spawn.y;
+        victimRef.maxHp = 3; // Reset Extra Core on death
+        victimRef.hp = victimRef.maxHp;
+        victimRef.hasShield = false;
+        victimRef.shieldExpire = 0;
+        victimRef.invisible = false;
+        victimRef.invisExpire = 0;
+        victimRef.speedBoost = false;
+        victimRef.speedExpire = 0;
+        victimRef.charging = false;
+        victimRef.chargeStartedAt = 0;
+        victimRef.lastShotAt = 0;
+        victimRef.inputSeq = 0;
+        victimRef.input = { w: false, a: false, s: false, d: false, angle: victimRef.angle || 0, charging: false, seq: 0 };
+        victimRef.inputIntegrity = { lastMask: 0, lastAt: 0, togglePoints: 0, windowStart: 0 };
+
+        io.to(roomCode).emit('playerRespawn', {
+            playerId: victimRef.id || victimId,
+            x: spawn.x,
+            y: spawn.y,
+            hp: victimRef.hp
+        });
     }, PLAYER_RESPAWN_DELAY);
     
     // Broadcast kill
