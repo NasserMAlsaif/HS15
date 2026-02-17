@@ -8,6 +8,7 @@ const socketIO = require('socket.io');
 const path = require('path');
 const crypto = require('crypto');
 const fs = require('fs');
+const { createIdentityStore } = require('./identity-store');
 
 const app = express();
 const server = http.createServer(app);
@@ -79,6 +80,17 @@ const ANTI_CHEAT_LOG_COOLDOWN_MS = 2000;
 const SESSION_TTL_MS = 1000 * 60 * 60 * 24 * 14; // 14 days
 const SESSION_SECRET = process.env.SESSION_SECRET || 'headshooter-dev-secret-change-me';
 const MATCH_RESULT_TTL_MS = 30 * 60 * 1000;
+const AUTH_VERIFY_TTL_MS = envInt('AUTH_VERIFY_TTL_MS', 10 * 60 * 1000, 60 * 1000, 24 * 60 * 60 * 1000);
+const AUTH_VERIFY_RESEND_COOLDOWN_MS = envInt('AUTH_VERIFY_RESEND_COOLDOWN_MS', 60 * 1000, 1000, 10 * 60 * 1000);
+const AUTH_VERIFY_MAX_SENDS_PER_HOUR = envInt('AUTH_VERIFY_MAX_SENDS_PER_HOUR', 5, 1, 100);
+const AUTH_VERIFY_MAX_ATTEMPTS = envInt('AUTH_VERIFY_MAX_ATTEMPTS', 8, 1, 100);
+const AUTH_PASSWORD_MIN_LEN = envInt('AUTH_PASSWORD_MIN_LEN', 8, 6, 128);
+const AUTH_PASSWORD_MAX_LEN = envInt('AUTH_PASSWORD_MAX_LEN', 72, AUTH_PASSWORD_MIN_LEN, 256);
+const AUTH_SCRYPT_N = envInt('AUTH_SCRYPT_N', 16384, 1024, 1048576);
+const AUTH_SCRYPT_R = envInt('AUTH_SCRYPT_R', 8, 1, 32);
+const AUTH_SCRYPT_P = envInt('AUTH_SCRYPT_P', 1, 1, 16);
+const AUTH_USERNAME_RE = /^[a-zA-Z0-9_]{3,24}$/;
+const AUTH_EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MAX_ANTI_CHEAT_REASON_SAMPLE = 20;
 const MAX_ANTI_CHEAT_RECENT = 100;
 const RECONNECT_GUARD_WINDOW_MS = 20000;
@@ -105,6 +117,7 @@ const SOFT_BLOCK_MS = envInt('ANTI_CHEAT_SOFT_BLOCK_MS', 3000, 200, 600000);
 const HARD_BLOCK_MS = envInt('ANTI_CHEAT_HARD_BLOCK_MS', 8000, 500, 600000);
 const BLOCK_LOG_COOLDOWN_MS = 1200;
 const ACTIVE_MATCH_STATES = new Set(['playing', 'starting', 'countdown']);
+const PARTY_INVITE_TTL_MS = envInt('PARTY_INVITE_TTL_MS', 45000, 5000, 10 * 60 * 1000);
 
 const KILLSTREAK_TIERS = {
     EXTRA_CORE: 3,
@@ -254,8 +267,10 @@ const BUFF_TYPES = ['health', 'shield', 'invis', 'speed'];
 
 // ==================== ROOM MANAGEMENT ====================
 const rooms = {};
-const sessions = {}; // persistentId -> { token, name, exp }
+const identityStore = createIdentityStore();
+const sessions = {}; // persistentId -> { token, name, exp, profileId, friendCode, username, isGuest }
 const pendingMatchResults = {}; // persistentId -> { roomCode, players, endedAt, exp }
+const partyInvitesById = {}; // inviteId -> { id, roomCode, fromProfileId, fromName, toProfileId, status, createdAt, expiresAt, respondedAt }
 const antiCheatMetrics = {
     startedAt: Date.now(),
     totalSuspiciousEvents: 0,
@@ -558,19 +573,22 @@ function signSessionPayload(payloadB64) {
     return crypto.createHmac('sha256', SESSION_SECRET).update(payloadB64).digest('base64url');
 }
 
-function issueSessionToken(persistentId, name) {
+function issueSessionToken(persistentId, name, extras = {}) {
     const payload = {
         pid: persistentId,
         name: name || 'Player',
         exp: Date.now() + SESSION_TTL_MS,
         nonce: crypto.randomBytes(12).toString('hex')
     };
+    if (extras && typeof extras.uid === 'string' && extras.uid) payload.uid = extras.uid;
+    if (extras && typeof extras.fc === 'string' && extras.fc) payload.fc = extras.fc;
+    if (extras && typeof extras.un === 'string' && extras.un) payload.un = extras.un;
     const payloadB64 = toBase64Url(JSON.stringify(payload));
     const sig = signSessionPayload(payloadB64);
     return `${payloadB64}.${sig}`;
 }
 
-function verifySessionToken(token, persistentId) {
+function verifySessionTokenAny(token) {
     if (!token || typeof token !== 'string') return null;
     const parts = token.split('.');
     if (parts.length !== 2) return null;
@@ -586,9 +604,142 @@ function verifySessionToken(token, persistentId) {
     } catch (e) {
         return null;
     }
-    if (!payload || payload.pid !== persistentId) return null;
+    if (!payload) return null;
     if (!payload.exp || Date.now() > payload.exp) return null;
     return payload;
+}
+
+function verifySessionToken(token, persistentId) {
+    const payload = verifySessionTokenAny(token);
+    if (!payload || payload.pid !== persistentId) return null;
+    return payload;
+}
+
+function extractAuthTokenFromRequest(req) {
+    if (req && req.body && typeof req.body.currentProfileToken === 'string' && req.body.currentProfileToken.trim()) {
+        return req.body.currentProfileToken.trim();
+    }
+    const hdr = req && req.headers ? req.headers.authorization : '';
+    if (typeof hdr === 'string' && hdr.toLowerCase().startsWith('bearer ')) {
+        return hdr.slice(7).trim();
+    }
+    return '';
+}
+
+function extractPersistentIdFromRequest(req) {
+    if (req && req.body && typeof req.body.persistentId === 'string') {
+        const v = req.body.persistentId.trim();
+        if (v) return v;
+    }
+    return '';
+}
+
+function normalizeAuthEmail(raw) {
+    return String(raw || '').trim().toLowerCase();
+}
+
+function normalizeAuthUsername(raw) {
+    return String(raw || '').trim().toLowerCase();
+}
+
+function scryptAsync(password, salt, opts) {
+    return new Promise((resolve, reject) => {
+        crypto.scrypt(password, salt, 64, opts, (err, derivedKey) => {
+            if (err) reject(err);
+            else resolve(derivedKey);
+        });
+    });
+}
+
+async function hashPasswordForAuth(password) {
+    const salt = crypto.randomBytes(16).toString('hex');
+    const opts = { N: AUTH_SCRYPT_N, r: AUTH_SCRYPT_R, p: AUTH_SCRYPT_P };
+    const key = await scryptAsync(password, salt, opts);
+    return `scrypt$${AUTH_SCRYPT_N}$${AUTH_SCRYPT_R}$${AUTH_SCRYPT_P}$${salt}$${key.toString('hex')}`;
+}
+
+async function verifyPasswordForAuth(password, storedHash) {
+    if (typeof storedHash !== 'string' || !storedHash.startsWith('scrypt$')) return false;
+    const parts = storedHash.split('$');
+    if (parts.length !== 6) return false;
+    const n = Number(parts[1]);
+    const r = Number(parts[2]);
+    const p = Number(parts[3]);
+    const salt = parts[4];
+    const expectedHex = parts[5];
+    if (!Number.isFinite(n) || !Number.isFinite(r) || !Number.isFinite(p) || !salt || !expectedHex) return false;
+    const derived = await scryptAsync(password, salt, { N: n, r, p });
+    const given = Buffer.from(expectedHex, 'hex');
+    if (!given.length || given.length !== derived.length) return false;
+    return crypto.timingSafeEqual(derived, given);
+}
+
+function resolveAuthDeviceContext(req) {
+    const token = extractAuthTokenFromRequest(req);
+    const tokenPayload = verifySessionTokenAny(token);
+    const bodyPersistentId = extractPersistentIdFromRequest(req);
+    const persistentId = bodyPersistentId || (tokenPayload && tokenPayload.pid ? tokenPayload.pid : '');
+    const profileId = tokenPayload && typeof tokenPayload.uid === 'string' ? tokenPayload.uid : '';
+    return { token, tokenPayload, persistentId, profileId };
+}
+
+function issueSessionForProfile(persistentId, profileSnapshot) {
+    const safePersistentId = String(persistentId || '').trim();
+    const safeProfile = profileSnapshot || {};
+    const sessionExp = Date.now() + SESSION_TTL_MS;
+    const token = issueSessionToken(safePersistentId, safeProfile.nickname || 'Player', {
+        uid: safeProfile.id || '',
+        fc: safeProfile.friendCode || '',
+        un: safeProfile.username || ''
+    });
+    sessions[safePersistentId] = {
+        token,
+        name: safeProfile.nickname || 'Player',
+        exp: sessionExp,
+        profileId: safeProfile.id || null,
+        friendCode: safeProfile.friendCode || null,
+        username: safeProfile.username || null,
+        isGuest: !!safeProfile.isGuest
+    };
+    return {
+        token,
+        exp: sessionExp,
+        profileId: safeProfile.id || null,
+        friendCode: safeProfile.friendCode || null,
+        username: safeProfile.username || null,
+        isGuest: !!safeProfile.isGuest
+    };
+}
+
+function sendAuthError(res, status, code, message, extra = {}) {
+    res.status(status).json({
+        ok: false,
+        error: code,
+        message,
+        ...extra
+    });
+}
+
+function mapIdentityError(res, err) {
+    const code = err && err.code ? String(err.code) : '';
+    if (code === 'EMAIL_ALREADY_USED') return sendAuthError(res, 409, code, 'Email already used.');
+    if (code === 'USERNAME_TAKEN') return sendAuthError(res, 409, code, 'Username is already taken.');
+    if (code === 'PROFILE_ALREADY_LINKED') return sendAuthError(res, 409, code, 'Profile is already linked to an account.');
+    if (code === 'INVALID_EMAIL') return sendAuthError(res, 400, code, 'Invalid email.');
+    if (code === 'INVALID_USERNAME') return sendAuthError(res, 400, code, 'Invalid username.');
+    if (code === 'INVALID_VERIFICATION_CODE') return sendAuthError(res, 400, code, 'Invalid verification code.');
+    if (code === 'VERIFICATION_CODE_EXPIRED') return sendAuthError(res, 400, code, 'Verification code expired.');
+    if (code === 'VERIFICATION_RATE_LIMITED') {
+        const retryAfterMs = err && Number.isFinite(err.retryAfterMs) ? Math.max(0, Math.floor(err.retryAfterMs)) : undefined;
+        return sendAuthError(res, 429, code, 'Verification rate limited.', retryAfterMs !== undefined ? { retryAfterMs } : {});
+    }
+    if (code === 'ACCOUNT_NOT_FOUND') return sendAuthError(res, 401, 'INVALID_CREDENTIALS', 'Invalid credentials.');
+    if (code === 'ACCOUNT_ALREADY_ACTIVE') return sendAuthError(res, 409, code, 'Account already active.');
+    if (code === 'EMAIL_NOT_VERIFIED') return sendAuthError(res, 403, code, 'Email is not verified.');
+    if (code === 'PROFILE_NOT_FOUND') return sendAuthError(res, 404, code, 'Profile not found.');
+    if (code === 'INVALID_DEVICE_OR_PROFILE') return sendAuthError(res, 400, code, 'Invalid device or profile.');
+    console.error('[auth] unhandled identity error', err && err.message ? err.message : err);
+    return sendAuthError(res, 500, 'AUTH_INTERNAL_ERROR', 'Authentication service error.');
 }
 function emitLobbyUpdate(roomCode, targetSocket = null) {
     const room = rooms[roomCode];
@@ -601,9 +752,70 @@ function emitLobbyUpdate(roomCode, targetSocket = null) {
     };
     if (targetSocket) {
         targetSocket.emit('lobbyUpdate', payload);
+        targetSocket.emit('party:lobbyState', payload);
         return;
     }
     io.to(roomCode).emit('lobbyUpdate', payload);
+    io.to(roomCode).emit('party:lobbyState', payload);
+}
+
+function makePartyInviteId() {
+    return `pinv_${crypto.randomBytes(8).toString('hex')}`;
+}
+
+function socketsByProfileId(profileId) {
+    if (!profileId) return [];
+    return Array.from(io.sockets.sockets.values()).filter((s) => s && s.profileId === profileId);
+}
+
+function notifyInviteStatus(invite, statusOverride = '') {
+    if (!invite) return;
+    const status = statusOverride || invite.status || 'expired';
+    const payload = {
+        inviteId: invite.id,
+        roomCode: invite.roomCode,
+        fromProfileId: invite.fromProfileId || null,
+        toProfileId: invite.toProfileId || null,
+        targetName: invite.toName || null,
+        status
+    };
+
+    socketsByProfileId(invite.toProfileId).forEach((s) => {
+        if (status === 'expired' || status === 'cancelled') {
+            s.emit('party:inviteExpired', payload);
+        }
+    });
+    socketsByProfileId(invite.fromProfileId).forEach((s) => {
+        s.emit('party:inviteResponded', payload);
+    });
+}
+
+function cleanupExpiredPartyInvites(now = Date.now()) {
+    const pruneBefore = now - (PARTY_INVITE_TTL_MS * 10);
+    Object.values(partyInvitesById).forEach((invite) => {
+        if (!invite) return;
+        if (invite.status === 'pending' && now >= Number(invite.expiresAt || 0)) {
+            invite.status = 'expired';
+            invite.respondedAt = now;
+            notifyInviteStatus(invite, 'expired');
+            return;
+        }
+        if (invite.status !== 'pending' && Number(invite.respondedAt || 0) > 0 && Number(invite.respondedAt || 0) < pruneBefore) {
+            delete partyInvitesById[invite.id];
+        }
+    });
+}
+
+function invalidatePartyInvitesForRoom(roomCode, status = 'cancelled') {
+    if (!roomCode) return;
+    const now = Date.now();
+    Object.values(partyInvitesById).forEach((invite) => {
+        if (!invite || invite.status !== 'pending') return;
+        if (invite.roomCode !== roomCode) return;
+        invite.status = status;
+        invite.respondedAt = now;
+        notifyInviteStatus(invite, status);
+    });
 }
 
 function clonePlayersForResults(room) {
@@ -611,7 +823,10 @@ function clonePlayersForResults(room) {
     Object.entries(room.players || {}).forEach(([key, p]) => {
         out[key] = {
             id: p.id,
+            profileId: p.profileId || null,
             persistentId: p.persistentId || null,
+            friendCode: p.friendCode || null,
+            username: p.username || null,
             name: p.name || 'Player',
             x: p.x || 0,
             y: p.y || 0,
@@ -723,7 +938,7 @@ function generateRoomCode() {
     return rooms[code] ? generateRoomCode() : code;
 }
 
-function createRoom(leaderId, leaderName, leaderPersistentId) {
+function createRoom(leaderId, leaderName, leaderPersistentId, leaderProfileMeta = null) {
     const code = generateRoomCode();
     rooms[code] = {
         code: code,
@@ -746,7 +961,7 @@ function createRoom(leaderId, leaderName, leaderPersistentId) {
     };
     
     // Add leader
-    rooms[code].players[leaderId] = makePlayer(leaderId, leaderName, leaderPersistentId, true);
+    rooms[code].players[leaderId] = makePlayer(leaderId, leaderName, leaderPersistentId, true, leaderProfileMeta);
     
     return code;
 }
@@ -1220,10 +1435,14 @@ function checkBuffPickup(roomCode, playerId) {
     });
 }
 
-function makePlayer(socketId, playerName, persistentId, isLeader) {
+function makePlayer(socketId, playerName, persistentId, isLeader, profileMeta = null) {
+    const safeMeta = profileMeta && typeof profileMeta === 'object' ? profileMeta : {};
     return {
         id: socketId,
+        profileId: safeMeta.profileId || null,
         persistentId: persistentId || null,
+        friendCode: safeMeta.friendCode || null,
+        username: safeMeta.username || null,
         name: playerName || 'Player',
         ready: !!isLeader,
         disconnected: false,
@@ -1369,6 +1588,9 @@ io.on('connection', (socket) => {
             delete room.players[oldKey];
             player.id = socket.id;
             player.name = socket.playerName || player.name;
+            player.profileId = socket.profileId || player.profileId || null;
+            player.friendCode = socket.friendCode || player.friendCode || null;
+            player.username = socket.username || player.username || null;
             player.disconnected = false;
             player.lastUpdate = Date.now();
             room.players[socket.id] = player;
@@ -1400,6 +1622,165 @@ io.on('connection', (socket) => {
         const allowed = rl.count <= maxCount;
         if (!allowed) registerRateLimitSuspicion(eventName);
         return allowed;
+    }
+
+    function emitFriendsError(code, fallbackMessage, extra = {}) {
+        const c = code ? String(code) : 'FRIENDS_ERROR';
+        const messages = {
+            PROFILE_NOT_FOUND: 'Profile not found.',
+            FRIEND_REQUEST_NOT_ALLOWED: 'Friend request is not allowed.',
+            FRIEND_REQUEST_ALREADY_EXISTS: 'Friend request already exists.',
+            ALREADY_FRIENDS: 'You are already friends.',
+            FRIEND_REQUEST_NOT_FOUND: 'Friend request not found.',
+            FRIEND_REQUEST_NOT_PENDING: 'Friend request is no longer pending.'
+        };
+        socket.emit('friends:error', {
+            ok: false,
+            error: c,
+            message: messages[c] || fallbackMessage || 'Friends action failed.',
+            ...extra
+        });
+    }
+
+    function findSocketsByProfileId(profileId) {
+        if (!profileId) return [];
+        return Array.from(io.sockets.sockets.values()).filter((s) => s && s.profileId === profileId);
+    }
+
+    async function emitFriendsStateToSocket(targetSocket) {
+        if (!targetSocket || !targetSocket.profileId) return null;
+        try {
+            const state = await identityStore.getFriendsState({ profileId: targetSocket.profileId });
+            targetSocket.emit('friends:listUpdated', {
+                ok: true,
+                profileId: state.profileId,
+                friends: state.friends || [],
+                incoming: state.incoming || [],
+                outgoing: state.outgoing || [],
+                incomingCount: Number(state.incomingCount || 0)
+            });
+            return state;
+        } catch (err) {
+            emitFriendsError(err && err.code ? err.code : '', err && err.message ? err.message : 'Could not load friends state.');
+            return null;
+        }
+    }
+
+    async function emitFriendsStateToProfile(profileId) {
+        if (!profileId) return;
+        const sockets = findSocketsByProfileId(profileId);
+        if (!sockets.length) return;
+        try {
+            const state = await identityStore.getFriendsState({ profileId });
+            sockets.forEach((s) => {
+                s.emit('friends:listUpdated', {
+                    ok: true,
+                    profileId: state.profileId,
+                    friends: state.friends || [],
+                    incoming: state.incoming || [],
+                    outgoing: state.outgoing || [],
+                    incomingCount: Number(state.incomingCount || 0)
+                });
+            });
+        } catch (_) {}
+    }
+
+    function emitPartyInviteError(code, fallbackMessage, extra = {}) {
+        const c = code ? String(code) : 'PARTY_INVITE_ERROR';
+        const messages = {
+            PROFILE_NOT_FOUND: 'Profile not found.',
+            PARTY_INVITE_NOT_ALLOWED: 'Party invite is not allowed.',
+            PARTY_NOT_FOUND: 'Party not found.',
+            PARTY_NOT_IN_LOBBY: 'Party is not in lobby.',
+            PARTY_FULL: 'Party is full.',
+            TARGET_NOT_ONLINE: 'Target player is offline.',
+            TARGET_ALREADY_IN_PARTY: 'Target player is already in this party.',
+            PARTY_INVITE_ALREADY_EXISTS: 'Invite already sent.',
+            PARTY_INVITE_NOT_FOUND: 'Invite not found.',
+            PARTY_INVITE_EXPIRED: 'Invite expired.',
+            ACTIVE_MATCH_LOCK: 'Cannot switch party while in active match.'
+        };
+        socket.emit('party:inviteError', {
+            ok: false,
+            error: c,
+            message: messages[c] || fallbackMessage || 'Party invite failed.',
+            ...extra
+        });
+    }
+
+    async function canInviteTargetProfile(fromProfileId, toProfileId) {
+        if (!fromProfileId || !toProfileId || fromProfileId === toProfileId) return false;
+        try {
+            const state = await identityStore.getFriendsState({ profileId: fromProfileId });
+            const friends = Array.isArray(state && state.friends) ? state.friends : [];
+            return friends.some((f) => f && f.profileId === toProfileId);
+        } catch (_) {
+            return false;
+        }
+    }
+
+    function joinSocketToLobbyRoomViaInvite(roomCode) {
+        const room = rooms[roomCode];
+        if (!room) {
+            return { ok: false, error: 'PARTY_NOT_FOUND', message: 'Party not found.' };
+        }
+        if (room.state !== 'lobby') {
+            return { ok: false, error: 'PARTY_NOT_IN_LOBBY', message: 'Party is not in lobby.' };
+        }
+
+        const existingEntry = socket.authPersistentId ? findPlayerEntryByPersistentId(room, socket.authPersistentId) : null;
+        const hasSlot = Object.keys(room.players || {}).length < MAX_PLAYERS_PER_ROOM;
+        if (!existingEntry && !hasSlot) {
+            return { ok: false, error: 'PARTY_FULL', message: 'Party is full.' };
+        }
+
+        if (socket.roomCode && rooms[socket.roomCode] && socket.roomCode !== roomCode) {
+            const current = rooms[socket.roomCode];
+            if (current && isActiveMatchState(current.state)) {
+                return { ok: false, error: 'ACTIVE_MATCH_LOCK', message: 'Leave your active match first.' };
+            }
+            removePlayerFromRoom();
+            socket.roomCode = null;
+            socket.playerKey = socket.id;
+            currentRoom = null;
+        }
+
+        if (existingEntry && existingEntry[1]) {
+            const oldKey = existingEntry[0];
+            const player = existingEntry[1];
+            if (oldKey !== socket.id) {
+                delete room.players[oldKey];
+            }
+            player.id = socket.id;
+            player.name = socket.playerName || player.name;
+            player.profileId = socket.profileId || player.profileId || null;
+            player.friendCode = socket.friendCode || player.friendCode || null;
+            player.username = socket.username || player.username || null;
+            player.disconnected = false;
+            player.lastUpdate = Date.now();
+            room.players[socket.id] = player;
+            if (room.leader === oldKey) room.leader = socket.id;
+        } else if (!room.players[socket.id]) {
+            room.players[socket.id] = makePlayer(socket.id, socket.playerName || 'Player', socket.authPersistentId, false, {
+                profileId: socket.profileId || null,
+                friendCode: socket.friendCode || null,
+                username: socket.username || null
+            });
+        }
+
+        socket.join(roomCode);
+        socket.roomCode = roomCode;
+        socket.playerKey = socket.id;
+        socket.authRoomCode = roomCode;
+        currentRoom = roomCode;
+
+        emitLobbyUpdate(roomCode);
+        socket.emit('roomJoined', {
+            roomCode,
+            players: room.players,
+            leaderId: room.leader
+        });
+        return { ok: true, room };
     }
 
     function ensureAntiCheatState(player, now) {
@@ -1705,6 +2086,9 @@ io.on('connection', (socket) => {
 
         player.id = socket.id;
         player.name = preferredName || socket.playerName || player.name;
+        player.profileId = socket.profileId || player.profileId || null;
+        player.friendCode = socket.friendCode || player.friendCode || null;
+        player.username = socket.username || player.username || null;
         player.disconnected = false;
         player.lastUpdate = Date.now();
         resetPlayerRealtimeInputState(player);
@@ -1765,6 +2149,7 @@ io.on('connection', (socket) => {
 
         const remainingPlayers = Object.values(room.players);
         if (remainingPlayers.length === 0) {
+            invalidatePartyInvitesForRoom(roomCode, 'cancelled');
             delete rooms[roomCode];
             console.log(`Room ${roomCode} deleted (empty)`);
             return;
@@ -1787,7 +2172,7 @@ io.on('connection', (socket) => {
     }
     
     // داخل io.on('connection', ...) في ملف server.js
-    socket.on('registerPlayer', (data) => {
+    socket.on('registerPlayer', async (data) => {
         if (!allowEvent('registerPlayer', 12, 10000)) return;
         if (!allowWindowCounter(handshakeGuards.registerByIp, socket.clientIp, REGISTER_IP_WINDOW_MS, MAX_REGISTER_PER_IP_WINDOW)) {
             registerRateLimitSuspicion('register_ip');
@@ -1807,8 +2192,35 @@ io.on('connection', (socket) => {
             return;
         }
 
+        let profileSnapshot = null;
+        try {
+            profileSnapshot = await identityStore.ensureGuestProfile({
+                persistentId: incomingId,
+                nickname: incomingName || 'Player'
+            });
+        } catch (e) {
+            console.error('[identity] ensure guest profile failed', e && e.message ? e.message : e);
+            socket.emit('authError', { message: 'Identity service unavailable. Please try again.' });
+            return;
+        }
+
         socket.persistentId = incomingId;
-        socket.playerName = incomingName || 'Player';
+        socket.profileId = profileSnapshot && profileSnapshot.id ? profileSnapshot.id : null;
+        socket.friendCode = profileSnapshot && profileSnapshot.friendCode ? profileSnapshot.friendCode : null;
+        socket.username = profileSnapshot && profileSnapshot.username ? profileSnapshot.username : null;
+        socket.isGuest = !(profileSnapshot && profileSnapshot.isGuest === false);
+        socket.playerName = (profileSnapshot && profileSnapshot.nickname) || incomingName || 'Player';
+
+        if (socket.roomCode && rooms[socket.roomCode]) {
+            const room = rooms[socket.roomCode];
+            const entry = findPlayerEntryByPersistentId(room, incomingId);
+            if (entry && entry[1]) {
+                entry[1].profileId = socket.profileId || null;
+                entry[1].friendCode = socket.friendCode || null;
+                entry[1].username = socket.username || null;
+                entry[1].name = socket.playerName || entry[1].name;
+            }
+        }
 
         const tokenPayload = verifySessionToken(incomingToken, incomingId);
         if (tokenPayload) {
@@ -1819,10 +2231,27 @@ io.on('connection', (socket) => {
             socket.authPersistentId = incomingId;
         }
 
-        const newToken = issueSessionToken(incomingId, socket.playerName);
-        sessions[incomingId] = { token: newToken, name: socket.playerName, exp: Date.now() + SESSION_TTL_MS };
-        socket.emit('sessionToken', { token: newToken, exp: sessions[incomingId].exp });
-        console.log(`Player recognized: ${socket.playerName} with ID: ${incomingId}`);
+        const session = issueSessionForProfile(incomingId, {
+            id: socket.profileId,
+            nickname: socket.playerName,
+            friendCode: socket.friendCode,
+            username: socket.username,
+            isGuest: socket.isGuest
+        });
+        socket.emit('sessionToken', {
+            token: session.token,
+            exp: session.exp,
+            profileId: session.profileId,
+            friendCode: session.friendCode,
+            username: session.username || null,
+            isGuest: session.isGuest
+        });
+        console.log(
+            `Player recognized: ${socket.playerName} with ID: ${incomingId}` +
+            (socket.profileId ? ` (profile ${socket.profileId})` : '')
+        );
+
+        await emitFriendsStateToSocket(socket);
 
         // If this device has a finished match pending, show results after reconnect.
         emitPendingMatchResultsForSocket(socket) || emitRecentRoomResultsForSocket(socket);
@@ -1849,6 +2278,444 @@ io.on('connection', (socket) => {
         }
 
         reconnectSocketToMatch(activeMatch, socket.playerName);
+    });
+
+    socket.on('friends:getList', async () => {
+        if (!allowEvent('friends:getList', 30, 10000)) return;
+        if (!socket.profileId) {
+            emitFriendsError('PROFILE_NOT_FOUND', 'Please register first.');
+            return;
+        }
+        await emitFriendsStateToSocket(socket);
+    });
+
+    socket.on('friends:search', async (data, ack) => {
+        if (!allowEvent('friends:search', 24, 10000)) return;
+        if (!socket.profileId) {
+            emitFriendsError('PROFILE_NOT_FOUND', 'Please register first.');
+            if (typeof ack === 'function') ack({ ok: false, error: 'PROFILE_NOT_FOUND', results: [] });
+            return;
+        }
+
+        const query = String(data && data.query ? data.query : '').trim();
+        const limit = Math.max(1, Math.min(20, Number(data && data.limit) || 10));
+        if (!query) {
+            const emptyPayload = { ok: true, query: '', results: [] };
+            if (typeof ack === 'function') ack(emptyPayload);
+            else socket.emit('friends:searchResult', emptyPayload);
+            return;
+        }
+
+        try {
+            const result = await identityStore.searchFriendProfiles({
+                profileId: socket.profileId,
+                query,
+                limit
+            });
+            const payload = {
+                ok: true,
+                query,
+                results: Array.isArray(result && result.results) ? result.results : []
+            };
+            if (typeof ack === 'function') ack(payload);
+            else socket.emit('friends:searchResult', payload);
+        } catch (err) {
+            const payload = {
+                ok: false,
+                error: err && err.code ? err.code : 'FRIENDS_SEARCH_FAILED',
+                message: err && err.message ? err.message : 'Search failed.',
+                results: []
+            };
+            if (typeof ack === 'function') ack(payload);
+            emitFriendsError(payload.error, payload.message);
+        }
+    });
+
+    socket.on('friends:sendRequest', async (data, ack) => {
+        if (!allowEvent('friends:sendRequest', 12, 10000)) return;
+        if (!socket.profileId) {
+            const payload = { ok: false, error: 'PROFILE_NOT_FOUND', message: 'Please register first.' };
+            if (typeof ack === 'function') ack(payload);
+            emitFriendsError(payload.error, payload.message);
+            return;
+        }
+
+        let toProfileId = String(data && data.targetProfileId ? data.targetProfileId : '').trim();
+        if (!toProfileId) {
+            toProfileId = String(data && data.profileId ? data.profileId : '').trim();
+        }
+        if (!toProfileId) {
+            const payload = { ok: false, error: 'PROFILE_NOT_FOUND', message: 'Target profile is required.' };
+            if (typeof ack === 'function') ack(payload);
+            emitFriendsError(payload.error, payload.message);
+            return;
+        }
+
+        try {
+            const created = await identityStore.sendFriendRequest({
+                fromProfileId: socket.profileId,
+                toProfileId
+            });
+            await emitFriendsStateToProfile(socket.profileId);
+            await emitFriendsStateToProfile(toProfileId);
+
+            const fromSnapshot = await identityStore.getProfileSnapshotById(socket.profileId);
+            const incomingPayload = {
+                ok: true,
+                requestId: created.requestId,
+                fromProfileId: socket.profileId,
+                toProfileId,
+                fromNickname: fromSnapshot && fromSnapshot.nickname ? fromSnapshot.nickname : socket.playerName || 'Player',
+                fromUsername: fromSnapshot && fromSnapshot.username ? fromSnapshot.username : null,
+                fromFriendCode: fromSnapshot && fromSnapshot.friendCode ? fromSnapshot.friendCode : null
+            };
+            findSocketsByProfileId(toProfileId).forEach((s) => {
+                s.emit('friends:incomingRequest', incomingPayload);
+            });
+
+            const okPayload = {
+                ok: true,
+                requestId: created.requestId,
+                targetProfileId: toProfileId
+            };
+            if (typeof ack === 'function') ack(okPayload);
+            else socket.emit('friends:requestSent', okPayload);
+        } catch (err) {
+            const payload = {
+                ok: false,
+                error: err && err.code ? err.code : 'FRIEND_REQUEST_FAILED',
+                message: err && err.message ? err.message : 'Could not send friend request.'
+            };
+            if (typeof ack === 'function') ack(payload);
+            emitFriendsError(payload.error, payload.message);
+        }
+    });
+
+    socket.on('friends:respondRequest', async (data, ack) => {
+        if (!allowEvent('friends:respondRequest', 20, 10000)) return;
+        if (!socket.profileId) {
+            const payload = { ok: false, error: 'PROFILE_NOT_FOUND', message: 'Please register first.' };
+            if (typeof ack === 'function') ack(payload);
+            emitFriendsError(payload.error, payload.message);
+            return;
+        }
+
+        const requestId = String(data && data.requestId ? data.requestId : '').trim();
+        const accept = !!(data && (data.accept === true || data.action === 'accept' || data.action === 'accepted'));
+        if (!requestId) {
+            const payload = { ok: false, error: 'FRIEND_REQUEST_NOT_FOUND', message: 'Request ID is required.' };
+            if (typeof ack === 'function') ack(payload);
+            emitFriendsError(payload.error, payload.message);
+            return;
+        }
+
+        try {
+            const updated = await identityStore.respondFriendRequest({
+                profileId: socket.profileId,
+                requestId,
+                accept
+            });
+            await emitFriendsStateToProfile(socket.profileId);
+            if (updated && updated.fromProfileId) {
+                await emitFriendsStateToProfile(updated.fromProfileId);
+            }
+
+            const payload = {
+                ok: true,
+                requestId,
+                status: updated && updated.status ? updated.status : (accept ? 'accepted' : 'rejected')
+            };
+            if (typeof ack === 'function') ack(payload);
+            else socket.emit('friends:requestResponded', payload);
+        } catch (err) {
+            const payload = {
+                ok: false,
+                error: err && err.code ? err.code : 'FRIEND_REQUEST_RESPONSE_FAILED',
+                message: err && err.message ? err.message : 'Could not respond to friend request.'
+            };
+            if (typeof ack === 'function') ack(payload);
+            emitFriendsError(payload.error, payload.message);
+        }
+    });
+
+    socket.on('party:inviteFriend', async (data, ack) => {
+        if (!allowEvent('party:inviteFriend', 12, 10000)) return;
+        cleanupExpiredPartyInvites();
+
+        if (!socket.profileId || !socket.authPersistentId) {
+            const payload = { ok: false, error: 'PROFILE_NOT_FOUND', message: 'Please register first.' };
+            if (typeof ack === 'function') ack(payload);
+            emitPartyInviteError(payload.error, payload.message);
+            return;
+        }
+
+        const roomCode = socket.roomCode;
+        const room = roomCode ? rooms[roomCode] : null;
+        ensureSocketPlayerBinding(room);
+        if (!room) {
+            const payload = { ok: false, error: 'PARTY_NOT_FOUND', message: 'You are not in a party.' };
+            if (typeof ack === 'function') ack(payload);
+            emitPartyInviteError(payload.error, payload.message);
+            return;
+        }
+        if (room.state !== 'lobby') {
+            const payload = { ok: false, error: 'PARTY_NOT_IN_LOBBY', message: 'Invites are allowed in lobby only.' };
+            if (typeof ack === 'function') ack(payload);
+            emitPartyInviteError(payload.error, payload.message);
+            return;
+        }
+
+        const senderPlayer = getPlayer(room);
+        if (!senderPlayer) {
+            const payload = { ok: false, error: 'PARTY_INVITE_NOT_ALLOWED', message: 'Party invite is not allowed.' };
+            if (typeof ack === 'function') ack(payload);
+            emitPartyInviteError(payload.error, payload.message);
+            return;
+        }
+
+        const targetProfileId = String(data && data.targetProfileId ? data.targetProfileId : '').trim();
+        if (!targetProfileId || targetProfileId === socket.profileId) {
+            const payload = { ok: false, error: 'PARTY_INVITE_NOT_ALLOWED', message: 'Invalid target.' };
+            if (typeof ack === 'function') ack(payload);
+            emitPartyInviteError(payload.error, payload.message);
+            return;
+        }
+
+        const alreadyInParty = Object.values(room.players || {}).some((p) => p && p.profileId === targetProfileId);
+        if (alreadyInParty) {
+            const payload = { ok: false, error: 'TARGET_ALREADY_IN_PARTY', message: 'Target is already in this party.' };
+            if (typeof ack === 'function') ack(payload);
+            emitPartyInviteError(payload.error, payload.message);
+            return;
+        }
+
+        const canInvite = await canInviteTargetProfile(socket.profileId, targetProfileId);
+        if (!canInvite) {
+            const payload = { ok: false, error: 'PARTY_INVITE_NOT_ALLOWED', message: 'You can invite friends only.' };
+            if (typeof ack === 'function') ack(payload);
+            emitPartyInviteError(payload.error, payload.message);
+            return;
+        }
+
+        const targetSockets = findSocketsByProfileId(targetProfileId);
+        if (!targetSockets.length) {
+            const payload = { ok: false, error: 'TARGET_NOT_ONLINE', message: 'Target player is offline.' };
+            if (typeof ack === 'function') ack(payload);
+            emitPartyInviteError(payload.error, payload.message);
+            return;
+        }
+
+        const existingInvite = Object.values(partyInvitesById).find((inv) => (
+            inv &&
+            inv.status === 'pending' &&
+            inv.roomCode === roomCode &&
+            inv.fromProfileId === socket.profileId &&
+            inv.toProfileId === targetProfileId &&
+            Number(inv.expiresAt || 0) > Date.now()
+        ));
+        if (existingInvite) {
+            const payload = {
+                ok: true,
+                inviteId: existingInvite.id,
+                roomCode,
+                targetProfileId,
+                message: 'Invite already pending.'
+            };
+            if (typeof ack === 'function') ack(payload);
+            socket.emit('party:inviteSent', payload);
+            return;
+        }
+
+        let targetSnapshot = null;
+        try {
+            targetSnapshot = await identityStore.getProfileSnapshotById(targetProfileId);
+        } catch (_) {
+            targetSnapshot = null;
+        }
+        const inviteId = makePartyInviteId();
+        const now = Date.now();
+        const invite = {
+            id: inviteId,
+            roomCode,
+            fromProfileId: socket.profileId,
+            fromName: senderPlayer.name || socket.playerName || 'Player',
+            toProfileId: targetProfileId,
+            toName: targetSnapshot && targetSnapshot.nickname ? targetSnapshot.nickname : 'Player',
+            status: 'pending',
+            createdAt: now,
+            expiresAt: now + PARTY_INVITE_TTL_MS,
+            respondedAt: 0
+        };
+        partyInvitesById[inviteId] = invite;
+
+        const outgoingPayload = {
+            ok: true,
+            inviteId,
+            roomCode,
+            fromProfileId: invite.fromProfileId,
+            fromName: invite.fromName,
+            toProfileId: invite.toProfileId,
+            expiresAt: invite.expiresAt
+        };
+        targetSockets.forEach((s) => {
+            s.emit('party:inviteReceived', outgoingPayload);
+        });
+
+        const sentPayload = {
+            ok: true,
+            inviteId,
+            roomCode,
+            targetProfileId,
+            targetName: invite.toName,
+            expiresAt: invite.expiresAt
+        };
+        if (typeof ack === 'function') ack(sentPayload);
+        socket.emit('party:inviteSent', sentPayload);
+    });
+
+    socket.on('party:inviteRespond', async (data, ack) => {
+        if (!allowEvent('party:inviteRespond', 18, 10000)) return;
+        cleanupExpiredPartyInvites();
+
+        if (!socket.profileId || !socket.authPersistentId) {
+            const payload = { ok: false, error: 'PROFILE_NOT_FOUND', message: 'Please register first.' };
+            if (typeof ack === 'function') ack(payload);
+            emitPartyInviteError(payload.error, payload.message);
+            return;
+        }
+
+        const inviteId = String(data && data.inviteId ? data.inviteId : '').trim();
+        const accept = !!(data && data.accept);
+        if (!inviteId) {
+            const payload = { ok: false, error: 'PARTY_INVITE_NOT_FOUND', message: 'Invite ID is required.' };
+            if (typeof ack === 'function') ack(payload);
+            emitPartyInviteError(payload.error, payload.message);
+            return;
+        }
+
+        const invite = partyInvitesById[inviteId];
+        if (!invite || invite.status !== 'pending') {
+            const payload = { ok: false, error: 'PARTY_INVITE_NOT_FOUND', message: 'Invite not found or already handled.' };
+            if (typeof ack === 'function') ack(payload);
+            emitPartyInviteError(payload.error, payload.message);
+            return;
+        }
+        if (invite.toProfileId !== socket.profileId) {
+            const payload = { ok: false, error: 'PARTY_INVITE_NOT_ALLOWED', message: 'This invite is not for this profile.' };
+            if (typeof ack === 'function') ack(payload);
+            emitPartyInviteError(payload.error, payload.message);
+            return;
+        }
+        if (Date.now() >= Number(invite.expiresAt || 0)) {
+            invite.status = 'expired';
+            invite.respondedAt = Date.now();
+            notifyInviteStatus(invite, 'expired');
+            const payload = { ok: false, error: 'PARTY_INVITE_EXPIRED', message: 'Invite expired.' };
+            if (typeof ack === 'function') ack(payload);
+            emitPartyInviteError(payload.error, payload.message);
+            return;
+        }
+
+        const senderSockets = findSocketsByProfileId(invite.fromProfileId);
+        let targetSnapshot = null;
+        try {
+            targetSnapshot = await identityStore.getProfileSnapshotById(socket.profileId);
+        } catch (_) {
+            targetSnapshot = null;
+        }
+        const targetName = targetSnapshot && targetSnapshot.nickname ? targetSnapshot.nickname : (socket.playerName || 'Player');
+
+        if (!accept) {
+            invite.status = 'rejected';
+            invite.respondedAt = Date.now();
+            const payload = { ok: true, inviteId, status: 'rejected' };
+            if (typeof ack === 'function') ack(payload);
+            senderSockets.forEach((s) => {
+                s.emit('party:inviteResponded', {
+                    ok: true,
+                    inviteId,
+                    status: 'rejected',
+                    roomCode: invite.roomCode,
+                    targetProfileId: socket.profileId,
+                    targetName
+                });
+            });
+            return;
+        }
+
+        const room = rooms[invite.roomCode];
+        if (!room || room.state !== 'lobby') {
+            invite.status = 'expired';
+            invite.respondedAt = Date.now();
+            senderSockets.forEach((s) => {
+                s.emit('party:inviteResponded', {
+                    ok: false,
+                    inviteId,
+                    status: 'expired',
+                    roomCode: invite.roomCode,
+                    targetProfileId: socket.profileId,
+                    targetName
+                });
+            });
+            const payload = { ok: false, error: 'PARTY_NOT_IN_LOBBY', message: 'Party is no longer available.' };
+            if (typeof ack === 'function') ack(payload);
+            emitPartyInviteError(payload.error, payload.message);
+            return;
+        }
+
+        const activeMatch = findActiveMatchForPersistentId(socket.authPersistentId);
+        if (activeMatch && activeMatch.roomCode !== invite.roomCode) {
+            const payload = { ok: false, error: 'ACTIVE_MATCH_LOCK', message: 'Leave your active match first.' };
+            if (typeof ack === 'function') ack(payload);
+            emitPartyInviteError(payload.error, payload.message);
+            return;
+        }
+
+        const joinResult = joinSocketToLobbyRoomViaInvite(invite.roomCode);
+        if (!joinResult.ok) {
+            invite.status = 'expired';
+            invite.respondedAt = Date.now();
+            senderSockets.forEach((s) => {
+                s.emit('party:inviteResponded', {
+                    ok: false,
+                    inviteId,
+                    status: 'expired',
+                    roomCode: invite.roomCode,
+                    targetProfileId: socket.profileId,
+                    targetName
+                });
+            });
+            const payload = {
+                ok: false,
+                error: joinResult.error || 'PARTY_NOT_IN_LOBBY',
+                message: joinResult.message || 'Could not join party.'
+            };
+            if (typeof ack === 'function') ack(payload);
+            emitPartyInviteError(payload.error, payload.message);
+            return;
+        }
+
+        invite.status = 'accepted';
+        invite.respondedAt = Date.now();
+
+        const okPayload = {
+            ok: true,
+            inviteId,
+            status: 'accepted',
+            roomCode: invite.roomCode
+        };
+        if (typeof ack === 'function') ack(okPayload);
+
+        senderSockets.forEach((s) => {
+            s.emit('party:inviteResponded', {
+                ok: true,
+                inviteId,
+                status: 'accepted',
+                roomCode: invite.roomCode,
+                targetProfileId: socket.profileId,
+                targetName
+            });
+        });
     });
 
     socket.on('pong', () => {
@@ -1887,7 +2754,12 @@ io.on('connection', (socket) => {
             socket.emit('error', { message: 'You already have an active match. Reconnect to continue.' });
             return;
         }
-        const code = createRoom(socket.id, data.playerName || 'Soldier', persistentId);
+        const displayName = socket.playerName || (data && data.playerName) || 'Soldier';
+        const code = createRoom(socket.id, displayName, persistentId, {
+            profileId: socket.profileId || null,
+            friendCode: socket.friendCode || null,
+            username: socket.username || null
+        });
         currentRoom = code;
         socket.join(code);
 
@@ -1902,7 +2774,7 @@ io.on('connection', (socket) => {
         });
         
         // طباعة اسم اللاعب في التيرمينال بدلاً من الـ ID فقط
-        console.log(`Room ${code} created by: ${data.playerName || 'Soldier'}`);
+        console.log(`Room ${code} created by: ${displayName}`);
 
         emitLobbyUpdate(code);
     });
@@ -1956,7 +2828,12 @@ io.on('connection', (socket) => {
         socket.roomCode = code;
         socket.playerKey = socket.id;
         
-        room.players[socket.id] = makePlayer(socket.id, data.playerName || 'Player', persistentId, false);
+        const displayName = socket.playerName || (data && data.playerName) || 'Player';
+        room.players[socket.id] = makePlayer(socket.id, displayName, persistentId, false, {
+            profileId: socket.profileId || null,
+            friendCode: socket.friendCode || null,
+            username: socket.username || null
+        });
         
         io.to(code).emit('playerJoined', {
             roomCode: code,
@@ -2057,6 +2934,7 @@ io.on('connection', (socket) => {
         room.lastMatchResults = null;
         room.lastMatchEndedAt = 0;
         room.lastMatchSeen = {};
+        invalidatePartyInvitesForRoom(roomCode, 'cancelled');
 
         room.projectiles = [];
         room.killChains = {};
@@ -2519,6 +3397,244 @@ setInterval(() => {
     });
 }, TICK_MS); // authoritative simulation tick rate
 
+setInterval(() => {
+    cleanupExpiredPartyInvites();
+}, 2000);
+
+// ==================== AUTH HTTP API ====================
+app.post('/auth/signup-link', async (req, res) => {
+    try {
+        const body = req.body || {};
+        const emailInput = String(body.email || '').trim();
+        const usernameInput = String(body.username || '').trim();
+        const password = typeof body.password === 'string' ? body.password : '';
+        const emailNorm = normalizeAuthEmail(emailInput);
+        if (!AUTH_EMAIL_RE.test(emailNorm)) {
+            sendAuthError(res, 400, 'INVALID_EMAIL', 'Invalid email.');
+            return;
+        }
+        if (!AUTH_USERNAME_RE.test(usernameInput)) {
+            sendAuthError(res, 400, 'INVALID_USERNAME', 'Username must be 3-24 chars (letters, numbers, underscore).');
+            return;
+        }
+        if (password.length < AUTH_PASSWORD_MIN_LEN || password.length > AUTH_PASSWORD_MAX_LEN) {
+            sendAuthError(
+                res,
+                400,
+                'WEAK_PASSWORD',
+                `Password must be ${AUTH_PASSWORD_MIN_LEN}-${AUTH_PASSWORD_MAX_LEN} characters.`
+            );
+            return;
+        }
+
+        const authCtx = resolveAuthDeviceContext(req);
+        if (!authCtx.persistentId) {
+            sendAuthError(res, 401, 'AUTH_CONTEXT_REQUIRED', 'Missing auth context. Provide currentProfileToken or persistentId.');
+            return;
+        }
+
+        let profileId = authCtx.profileId;
+        if (!profileId) {
+            const ensured = await identityStore.ensureGuestProfile({
+                persistentId: authCtx.persistentId,
+                nickname: (authCtx.tokenPayload && authCtx.tokenPayload.name) || 'Player'
+            });
+            profileId = ensured && ensured.id ? ensured.id : '';
+        }
+        if (!profileId) {
+            sendAuthError(res, 500, 'PROFILE_RESOLUTION_FAILED', 'Could not resolve active profile.');
+            return;
+        }
+
+        const passwordHash = await hashPasswordForAuth(password);
+        const created = await identityStore.createPendingLinkedAccount({
+            profileId,
+            email: emailInput,
+            username: usernameInput,
+            passwordHash,
+            codeTtlMs: AUTH_VERIFY_TTL_MS
+        });
+
+        const payload = {
+            ok: true,
+            verification_required: true
+        };
+        if (IS_DEV_MODE && created && created.verificationCode) {
+            payload.devVerificationCode = created.verificationCode;
+            payload.devExpiresAt = created.expiresAt || null;
+        }
+        res.json(payload);
+    } catch (err) {
+        mapIdentityError(res, err);
+    }
+});
+
+app.post('/auth/resend-verification', async (req, res) => {
+    try {
+        const body = req.body || {};
+        const emailInput = String(body.email || '').trim();
+        const emailNorm = normalizeAuthEmail(emailInput);
+        if (!AUTH_EMAIL_RE.test(emailNorm)) {
+            sendAuthError(res, 400, 'INVALID_EMAIL', 'Invalid email.');
+            return;
+        }
+
+        const resent = await identityStore.resendVerification({
+            email: emailInput,
+            codeTtlMs: AUTH_VERIFY_TTL_MS,
+            resendCooldownMs: AUTH_VERIFY_RESEND_COOLDOWN_MS,
+            maxSendsPerHour: AUTH_VERIFY_MAX_SENDS_PER_HOUR
+        });
+
+        const payload = { ok: true, resent: true };
+        if (IS_DEV_MODE && resent && resent.verificationCode) {
+            payload.devVerificationCode = resent.verificationCode;
+            payload.devExpiresAt = resent.expiresAt || null;
+        }
+        res.json(payload);
+    } catch (err) {
+        if (err && err.code === 'ACCOUNT_NOT_FOUND') {
+            res.json({ ok: true, resent: true });
+            return;
+        }
+        mapIdentityError(res, err);
+    }
+});
+
+app.post('/auth/verify-email', async (req, res) => {
+    try {
+        const body = req.body || {};
+        const emailInput = String(body.email || '').trim();
+        const otp = String(body.otp || '').trim();
+        const emailNorm = normalizeAuthEmail(emailInput);
+        if (!AUTH_EMAIL_RE.test(emailNorm)) {
+            sendAuthError(res, 400, 'INVALID_EMAIL', 'Invalid email.');
+            return;
+        }
+        if (!otp) {
+            sendAuthError(res, 400, 'INVALID_VERIFICATION_CODE', 'Verification code is required.');
+            return;
+        }
+
+        const verified = await identityStore.verifyEmailCode({
+            email: emailInput,
+            otp,
+            maxVerifyAttempts: AUTH_VERIFY_MAX_ATTEMPTS
+        });
+
+        const authCtx = resolveAuthDeviceContext(req);
+        let profileSnapshot = null;
+        if (verified && verified.profileId) {
+            if (authCtx.persistentId) {
+                await identityStore.setActiveProfileForDevice({
+                    persistentId: authCtx.persistentId,
+                    profileId: verified.profileId
+                });
+            }
+            profileSnapshot = await identityStore.getProfileSnapshotById(verified.profileId);
+        }
+
+        let session = null;
+        if (authCtx.persistentId && profileSnapshot) {
+            session = issueSessionForProfile(authCtx.persistentId, profileSnapshot);
+        }
+
+        res.json({
+            ok: true,
+            account_activated: true,
+            profile: profileSnapshot,
+            session
+        });
+    } catch (err) {
+        mapIdentityError(res, err);
+    }
+});
+
+app.post('/auth/signin', async (req, res) => {
+    try {
+        const body = req.body || {};
+        const login = String(body.email_or_username || '').trim();
+        const password = typeof body.password === 'string' ? body.password : '';
+        if (!login || !password) {
+            sendAuthError(res, 400, 'INVALID_CREDENTIALS', 'Email/username and password are required.');
+            return;
+        }
+
+        const authCtx = resolveAuthDeviceContext(req);
+        if (!authCtx.persistentId) {
+            sendAuthError(res, 401, 'AUTH_CONTEXT_REQUIRED', 'Missing auth context. Provide currentProfileToken or persistentId.');
+            return;
+        }
+
+        const account = await identityStore.findAccountByLogin({ login });
+        if (!account) {
+            sendAuthError(res, 401, 'INVALID_CREDENTIALS', 'Invalid credentials.');
+            return;
+        }
+        if (account.status === 'pending_verification') {
+            sendAuthError(res, 403, 'EMAIL_NOT_VERIFIED', 'Email is not verified.');
+            return;
+        }
+        if (account.status === 'suspended') {
+            sendAuthError(res, 403, 'ACCOUNT_SUSPENDED', 'Account is suspended.');
+            return;
+        }
+
+        const passOk = await verifyPasswordForAuth(password, account.passwordHash);
+        if (!passOk) {
+            sendAuthError(res, 401, 'INVALID_CREDENTIALS', 'Invalid credentials.');
+            return;
+        }
+        if (!account.profileId) {
+            sendAuthError(res, 500, 'ACCOUNT_LINK_CORRUPT', 'Account profile link is missing.');
+            return;
+        }
+
+        await identityStore.setActiveProfileForDevice({
+            persistentId: authCtx.persistentId,
+            profileId: account.profileId
+        });
+        const profileSnapshot = await identityStore.getProfileSnapshotById(account.profileId);
+        if (!profileSnapshot) {
+            sendAuthError(res, 500, 'PROFILE_RESOLUTION_FAILED', 'Could not resolve account profile.');
+            return;
+        }
+        const session = issueSessionForProfile(authCtx.persistentId, profileSnapshot);
+        res.json({
+            ok: true,
+            profile: profileSnapshot,
+            session
+        });
+    } catch (err) {
+        mapIdentityError(res, err);
+    }
+});
+
+app.post('/auth/logout', async (req, res) => {
+    try {
+        const body = req.body || {};
+        const authCtx = resolveAuthDeviceContext(req);
+        if (!authCtx.persistentId) {
+            res.json({ ok: true, loggedOut: true });
+            return;
+        }
+
+        const guestSnapshot = await identityStore.switchToGuestProfileForDevice({
+            persistentId: authCtx.persistentId,
+            nickname: String(body.guestNickname || (authCtx.tokenPayload && authCtx.tokenPayload.name) || 'Player')
+        });
+        const session = issueSessionForProfile(authCtx.persistentId, guestSnapshot);
+        res.json({
+            ok: true,
+            loggedOut: true,
+            profile: guestSnapshot,
+            session
+        });
+    } catch (err) {
+        mapIdentityError(res, err);
+    }
+});
+
 // ==================== SERVE CLIENT ====================
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -2741,7 +3857,7 @@ setInterval(() => {
     appendAntiCheatSnapshot(Date.now());
 }, 10000);
 
-server.listen(PORT, () => {
+function logServerBanner() {
     console.log(`
 ╔═══════════════════════════════════════╗
 ║   HEADSHOOTER SERVER RUNNING          ║
@@ -2749,13 +3865,41 @@ server.listen(PORT, () => {
 ║   Ready for connections!              ║
 ╚═══════════════════════════════════════╝
     `);
-});
+}
 
-// Handle shutdown
-process.on('SIGINT', () => {
-    console.log('\nShutting down server...');
-    server.close(() => {
+async function startServer() {
+    try {
+        await identityStore.init();
+        const identityMeta = identityStore.describe();
+        console.log(`[identity] store mode: ${identityMeta.mode}`);
+    } catch (e) {
+        console.error('[identity] failed to initialize store', e && e.message ? e.message : e);
+        process.exit(1);
+        return;
+    }
+
+    server.listen(PORT, () => {
+        logServerBanner();
+    });
+}
+
+let isShuttingDown = false;
+function handleShutdown(signal) {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
+    console.log(`\nShutting down server (${signal})...`);
+    server.close(async () => {
+        try {
+            await identityStore.close();
+        } catch (e) {
+            console.warn('[identity] close failed', e && e.message ? e.message : e);
+        }
         console.log('Server closed');
         process.exit(0);
     });
-});
+}
+
+process.on('SIGINT', () => handleShutdown('SIGINT'));
+process.on('SIGTERM', () => handleShutdown('SIGTERM'));
+
+startServer();
