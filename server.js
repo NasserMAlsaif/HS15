@@ -8,6 +8,7 @@ const socketIO = require('socket.io');
 const path = require('path');
 const crypto = require('crypto');
 const fs = require('fs');
+const nodemailer = require('nodemailer');
 const { createIdentityStore } = require('./identity-store');
 
 const app = express();
@@ -31,6 +32,12 @@ function envInt(name, fallback, min, max) {
     if (!Number.isFinite(raw)) return fallback;
     const v = Math.floor(raw);
     return Math.max(min, Math.min(max, v));
+}
+
+function envBool(name, fallback = false) {
+    const raw = String(process.env[name] || '').trim().toLowerCase();
+    if (!raw) return !!fallback;
+    return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
 }
 
 const ANTI_CHEAT_MODE = String(process.env.ANTI_CHEAT_MODE || 'observe').toLowerCase() === 'enforce'
@@ -91,6 +98,13 @@ const AUTH_SCRYPT_R = envInt('AUTH_SCRYPT_R', 8, 1, 32);
 const AUTH_SCRYPT_P = envInt('AUTH_SCRYPT_P', 1, 1, 16);
 const AUTH_USERNAME_RE = /^[a-zA-Z0-9_]{3,24}$/;
 const AUTH_EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const AUTH_SMTP_HOST = String(process.env.AUTH_SMTP_HOST || '').trim();
+const AUTH_SMTP_PORT = envInt('AUTH_SMTP_PORT', 587, 1, 65535);
+const AUTH_SMTP_SECURE = envBool('AUTH_SMTP_SECURE', false);
+const AUTH_SMTP_USER = String(process.env.AUTH_SMTP_USER || '').trim();
+const AUTH_SMTP_PASS = String(process.env.AUTH_SMTP_PASS || '');
+const AUTH_EMAIL_FROM = String(process.env.AUTH_EMAIL_FROM || AUTH_SMTP_USER || '').trim();
+const AUTH_ALLOW_OTP_FALLBACK = envBool('AUTH_ALLOW_OTP_FALLBACK', IS_DEV_MODE);
 const MAX_ANTI_CHEAT_REASON_SAMPLE = 20;
 const MAX_ANTI_CHEAT_RECENT = 100;
 const RECONNECT_GUARD_WINDOW_MS = 20000;
@@ -738,8 +752,128 @@ function mapIdentityError(res, err) {
     if (code === 'EMAIL_NOT_VERIFIED') return sendAuthError(res, 403, code, 'Email is not verified.');
     if (code === 'PROFILE_NOT_FOUND') return sendAuthError(res, 404, code, 'Profile not found.');
     if (code === 'INVALID_DEVICE_OR_PROFILE') return sendAuthError(res, 400, code, 'Invalid device or profile.');
+    if (code === 'EMAIL_DELIVERY_NOT_CONFIGURED') {
+        return sendAuthError(res, 503, code, 'Verification email service is not configured on this server.');
+    }
+    if (code === 'EMAIL_DELIVERY_FAILED') {
+        return sendAuthError(res, 503, code, 'Could not send verification email right now. Try again.');
+    }
     console.error('[auth] unhandled identity error', err && err.message ? err.message : err);
     return sendAuthError(res, 500, 'AUTH_INTERNAL_ERROR', 'Authentication service error.');
+}
+
+function authFlowError(code, message, extra = {}) {
+    const err = new Error(message || 'Authentication flow error.');
+    err.code = String(code || 'AUTH_FLOW_ERROR');
+    if (extra && typeof extra === 'object') Object.assign(err, extra);
+    return err;
+}
+
+function createAuthEmailTransport() {
+    if (!AUTH_SMTP_HOST || !AUTH_SMTP_USER || !AUTH_SMTP_PASS || !AUTH_EMAIL_FROM) {
+        return null;
+    }
+    try {
+        return nodemailer.createTransport({
+            host: AUTH_SMTP_HOST,
+            port: AUTH_SMTP_PORT,
+            secure: AUTH_SMTP_SECURE,
+            auth: {
+                user: AUTH_SMTP_USER,
+                pass: AUTH_SMTP_PASS
+            }
+        });
+    } catch (err) {
+        console.error('[auth-email] failed to initialize SMTP transport', err && err.message ? err.message : err);
+        return null;
+    }
+}
+
+const authEmailTransport = createAuthEmailTransport();
+const authEmailReady = !!authEmailTransport;
+if (!authEmailReady) {
+    console.warn('[auth-email] SMTP not configured. Verification will require OTP fallback mode.');
+}
+
+function authOtpFallbackPayload(verificationCode, expiresAt) {
+    return {
+        delivery: 'otp_fallback',
+        devVerificationCode: verificationCode,
+        devExpiresAt: expiresAt || null
+    };
+}
+
+async function sendVerificationEmail(params) {
+    const email = String(params && params.email ? params.email : '').trim();
+    const verificationCode = String(params && params.verificationCode ? params.verificationCode : '').trim();
+    const username = String(params && params.username ? params.username : '').trim();
+    const expiresAtMs = Number(params && params.expiresAt ? params.expiresAt : 0) || 0;
+    if (!email || !verificationCode) {
+        throw authFlowError('EMAIL_DELIVERY_FAILED', 'Could not prepare verification email.');
+    }
+    if (!authEmailReady) {
+        throw authFlowError(
+            'EMAIL_DELIVERY_NOT_CONFIGURED',
+            'Verification email service is not configured on this server.'
+        );
+    }
+
+    const expiresMinutes = Math.max(
+        1,
+        Math.ceil(((expiresAtMs || (Date.now() + AUTH_VERIFY_TTL_MS)) - Date.now()) / 60000)
+    );
+    const minSuffix = expiresMinutes === 1 ? '' : 's';
+    const greeting = username ? `Hi ${username},` : 'Hi,';
+    const subject = 'HeadShooter verification code';
+    const textBody =
+        `${greeting}\n\n` +
+        `Your HeadShooter verification code is: ${verificationCode}\n` +
+        `This code expires in about ${expiresMinutes} minute${minSuffix}.\n\n` +
+        'If this was not you, please ignore this message.';
+    const htmlBody =
+        `<p>${greeting}</p>` +
+        `<p>Your HeadShooter verification code is:</p>` +
+        `<p style="font-size:24px;font-weight:800;letter-spacing:4px;margin:10px 0;">${verificationCode}</p>` +
+        `<p>This code expires in about <strong>${expiresMinutes} minute${minSuffix}</strong>.</p>` +
+        '<p>If this was not you, you can ignore this message.</p>';
+
+    try {
+        await authEmailTransport.sendMail({
+            from: AUTH_EMAIL_FROM,
+            to: email,
+            subject,
+            text: textBody,
+            html: htmlBody
+        });
+        return { delivery: 'email' };
+    } catch (err) {
+        console.error('[auth-email] send failed', err && err.message ? err.message : err);
+        throw authFlowError('EMAIL_DELIVERY_FAILED', 'Could not send verification email right now.');
+    }
+}
+
+async function resolveVerificationDelivery(params) {
+    const verificationCode = String(params && params.verificationCode ? params.verificationCode : '').trim();
+    const expiresAt = params && params.expiresAt ? params.expiresAt : null;
+
+    if (authEmailReady) {
+        try {
+            return await sendVerificationEmail(params);
+        } catch (err) {
+            if (AUTH_ALLOW_OTP_FALLBACK && verificationCode) {
+                return authOtpFallbackPayload(verificationCode, expiresAt);
+            }
+            throw err;
+        }
+    }
+
+    if (AUTH_ALLOW_OTP_FALLBACK && verificationCode) {
+        return authOtpFallbackPayload(verificationCode, expiresAt);
+    }
+    throw authFlowError(
+        'EMAIL_DELIVERY_NOT_CONFIGURED',
+        'Verification email is not available yet. Configure SMTP first.'
+    );
 }
 function emitLobbyUpdate(roomCode, targetSocket = null) {
     const room = rooms[roomCode];
@@ -3445,6 +3579,10 @@ app.post('/auth/signup-link', async (req, res) => {
             sendAuthError(res, 500, 'PROFILE_RESOLUTION_FAILED', 'Could not resolve active profile.');
             return;
         }
+        if (!authEmailReady && !AUTH_ALLOW_OTP_FALLBACK) {
+            sendAuthError(res, 503, 'EMAIL_DELIVERY_NOT_CONFIGURED', 'Verification email service is not configured on this server.');
+            return;
+        }
 
         const passwordHash = await hashPasswordForAuth(password);
         const created = await identityStore.createPendingLinkedAccount({
@@ -3455,13 +3593,23 @@ app.post('/auth/signup-link', async (req, res) => {
             codeTtlMs: AUTH_VERIFY_TTL_MS
         });
 
+        const delivery = await resolveVerificationDelivery({
+            email: emailInput,
+            username: usernameInput,
+            verificationCode: created && created.verificationCode ? created.verificationCode : '',
+            expiresAt: created && created.expiresAt ? created.expiresAt : null
+        });
         const payload = {
             ok: true,
-            verification_required: true
+            verification_required: true,
+            delivery: delivery && delivery.delivery ? delivery.delivery : 'email',
+            message: (delivery && delivery.delivery === 'otp_fallback')
+                ? 'Verification required. Use the code shown now (email delivery unavailable).'
+                : 'Verification required. Check your email for the code.'
         };
-        if (IS_DEV_MODE && created && created.verificationCode) {
-            payload.devVerificationCode = created.verificationCode;
-            payload.devExpiresAt = created.expiresAt || null;
+        if (delivery && delivery.devVerificationCode) {
+            payload.devVerificationCode = delivery.devVerificationCode;
+            payload.devExpiresAt = delivery.devExpiresAt || null;
         }
         res.json(payload);
     } catch (err) {
@@ -3478,6 +3626,10 @@ app.post('/auth/resend-verification', async (req, res) => {
             sendAuthError(res, 400, 'INVALID_EMAIL', 'Invalid email.');
             return;
         }
+        if (!authEmailReady && !AUTH_ALLOW_OTP_FALLBACK) {
+            sendAuthError(res, 503, 'EMAIL_DELIVERY_NOT_CONFIGURED', 'Verification email service is not configured on this server.');
+            return;
+        }
 
         const resent = await identityStore.resendVerification({
             email: emailInput,
@@ -3486,10 +3638,22 @@ app.post('/auth/resend-verification', async (req, res) => {
             maxSendsPerHour: AUTH_VERIFY_MAX_SENDS_PER_HOUR
         });
 
-        const payload = { ok: true, resent: true };
-        if (IS_DEV_MODE && resent && resent.verificationCode) {
-            payload.devVerificationCode = resent.verificationCode;
-            payload.devExpiresAt = resent.expiresAt || null;
+        const delivery = await resolveVerificationDelivery({
+            email: emailInput,
+            verificationCode: resent && resent.verificationCode ? resent.verificationCode : '',
+            expiresAt: resent && resent.expiresAt ? resent.expiresAt : null
+        });
+        const payload = {
+            ok: true,
+            resent: true,
+            delivery: delivery && delivery.delivery ? delivery.delivery : 'email',
+            message: (delivery && delivery.delivery === 'otp_fallback')
+                ? 'Verification code resent. Use the code shown now (email delivery unavailable).'
+                : 'Verification code resent. Check your email.'
+        };
+        if (delivery && delivery.devVerificationCode) {
+            payload.devVerificationCode = delivery.devVerificationCode;
+            payload.devExpiresAt = delivery.devExpiresAt || null;
         }
         res.json(payload);
     } catch (err) {
