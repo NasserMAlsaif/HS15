@@ -656,6 +656,29 @@ function normalizeAuthUsername(raw) {
     return String(raw || '').trim().toLowerCase();
 }
 
+function sanitizePlayerNickname(raw) {
+    const base = String(raw || '').trim();
+    if (!base) return '';
+    return base.slice(0, 12);
+}
+
+function validateAuthPasswordPolicy(password) {
+    const pass = String(password || '');
+    if (!/[A-Z]/.test(pass)) {
+        return { ok: false, message: 'Password must include at least one uppercase letter.' };
+    }
+    if (!/[a-z]/.test(pass)) {
+        return { ok: false, message: 'Password must include at least one lowercase letter.' };
+    }
+    if (!/[0-9]/.test(pass)) {
+        return { ok: false, message: 'Password must include at least one number.' };
+    }
+    if (!/[^A-Za-z0-9]/.test(pass)) {
+        return { ok: false, message: 'Password must include at least one symbol.' };
+    }
+    return { ok: true, message: '' };
+}
+
 function scryptAsync(password, salt, opts) {
     return new Promise((resolve, reject) => {
         crypto.scrypt(password, salt, 64, opts, (err, derivedKey) => {
@@ -2414,6 +2437,105 @@ io.on('connection', (socket) => {
         reconnectSocketToMatch(activeMatch, socket.playerName);
     });
 
+    socket.on('updateName', async (data, ack) => {
+        if (!allowEvent('updateName', 10, 10000)) return;
+        if (!socket.authPersistentId) {
+            if (typeof ack === 'function') {
+                ack({ ok: false, error: 'AUTH_REQUIRED', message: 'Please reconnect and try again.' });
+            }
+            return;
+        }
+
+        const requestedName = sanitizePlayerNickname(data && data.newName);
+        if (!requestedName) {
+            if (typeof ack === 'function') {
+                ack({ ok: false, error: 'INVALID_NAME', message: 'Name must be 1-12 characters.' });
+            }
+            return;
+        }
+
+        try {
+            const updatedProfile = await identityStore.ensureGuestProfile({
+                persistentId: socket.authPersistentId,
+                nickname: requestedName
+            });
+            if (!updatedProfile || !updatedProfile.id) {
+                throw new Error('profile update failed');
+            }
+
+            socket.playerName = updatedProfile.nickname || requestedName;
+            socket.profileId = updatedProfile.id || socket.profileId || null;
+            socket.friendCode = updatedProfile.friendCode || socket.friendCode || null;
+            socket.username = updatedProfile.username || socket.username || null;
+            socket.isGuest = !(updatedProfile.isGuest === false);
+
+            const touchedRooms = new Set();
+            Object.entries(rooms).forEach(([roomCode, room]) => {
+                if (!room || !room.players) return;
+                Object.values(room.players).forEach((player) => {
+                    if (!player) return;
+                    const sameProfile = socket.profileId && player.profileId && player.profileId === socket.profileId;
+                    const samePersistent = socket.authPersistentId && player.persistentId === socket.authPersistentId;
+                    if (!sameProfile && !samePersistent) return;
+                    player.name = socket.playerName;
+                    player.profileId = socket.profileId || player.profileId || null;
+                    player.friendCode = socket.friendCode || player.friendCode || null;
+                    player.username = socket.username || player.username || null;
+                    touchedRooms.add(roomCode);
+                });
+            });
+            touchedRooms.forEach((roomCode) => emitLobbyUpdate(roomCode));
+
+            Object.values(partyInvitesById).forEach((invite) => {
+                if (!invite) return;
+                if (socket.profileId && invite.fromProfileId === socket.profileId) {
+                    invite.fromName = socket.playerName;
+                }
+                if (socket.profileId && invite.toProfileId === socket.profileId) {
+                    invite.toName = socket.playerName;
+                }
+            });
+
+            const connectedProfileSockets = Array.from(io.sockets.sockets.values()).filter((s) => s && s.profileId);
+            await Promise.all(connectedProfileSockets.map((s) => emitFriendsStateToSocket(s)));
+
+            findSocketsByProfileId(socket.profileId).forEach((s) => {
+                if (!s) return;
+                s.playerName = socket.playerName;
+                s.emit('profile:nicknameUpdated', {
+                    profileId: socket.profileId,
+                    nickname: socket.playerName
+                });
+            });
+
+            const session = issueSessionForProfile(socket.authPersistentId, updatedProfile);
+            socket.emit('sessionToken', {
+                token: session.token,
+                exp: session.exp,
+                profileId: session.profileId,
+                friendCode: session.friendCode,
+                username: session.username || null,
+                isGuest: session.isGuest
+            });
+
+            if (typeof ack === 'function') {
+                ack({
+                    ok: true,
+                    profileId: socket.profileId,
+                    nickname: socket.playerName
+                });
+            }
+        } catch (err) {
+            if (typeof ack === 'function') {
+                ack({
+                    ok: false,
+                    error: 'NAME_UPDATE_FAILED',
+                    message: 'Could not update name right now.'
+                });
+            }
+        }
+    });
+
     socket.on('friends:getList', async () => {
         if (!allowEvent('friends:getList', 30, 10000)) return;
         if (!socket.profileId) {
@@ -3558,6 +3680,11 @@ app.post('/auth/signup-link', async (req, res) => {
                 'WEAK_PASSWORD',
                 `Password must be ${AUTH_PASSWORD_MIN_LEN}-${AUTH_PASSWORD_MAX_LEN} characters.`
             );
+            return;
+        }
+        const passwordPolicy = validateAuthPasswordPolicy(password);
+        if (!passwordPolicy.ok) {
+            sendAuthError(res, 400, 'WEAK_PASSWORD', passwordPolicy.message || 'Password does not meet security requirements.');
             return;
         }
 
