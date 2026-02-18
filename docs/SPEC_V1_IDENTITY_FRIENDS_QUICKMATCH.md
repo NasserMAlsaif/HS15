@@ -375,3 +375,11 @@ Current code uses `persistentId` and in-memory sessions.
 5. Phase E: quick queue + cancel confirm + queue metrics.
 6. Phase F: Redis queue + central worker for multi-server ME.
 
+## 17) Rewarded Buff Rule (Locked)
+
+1. Rewarded ad grants `Instant Respawn` buff.
+2. Buff has up to `3 instant respawns` available in the next match.
+3. If player enters a match and gets `0 deaths`, buff is not consumed and carries to next match.
+4. If player gets at least `1 death` and instant respawn is used, buff is considered consumed for that match session.
+5. At end of that match (where buff was used at least once), remove buff completely.
+6. Player can watch a new rewarded ad to get buff again.

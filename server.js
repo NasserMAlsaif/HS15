@@ -105,6 +105,7 @@ const AUTH_SMTP_USER = String(process.env.AUTH_SMTP_USER || '').trim();
 const AUTH_SMTP_PASS = String(process.env.AUTH_SMTP_PASS || '');
 const AUTH_EMAIL_FROM = String(process.env.AUTH_EMAIL_FROM || AUTH_SMTP_USER || '').trim();
 const AUTH_ALLOW_OTP_FALLBACK = envBool('AUTH_ALLOW_OTP_FALLBACK', IS_DEV_MODE);
+const AUTH_REQUIRE_PERSISTENT_STORE = envBool('AUTH_REQUIRE_PERSISTENT_STORE', !IS_DEV_MODE);
 const MAX_ANTI_CHEAT_REASON_SAMPLE = 20;
 const MAX_ANTI_CHEAT_RECENT = 100;
 const RECONNECT_GUARD_WINDOW_MS = 20000;
@@ -670,6 +671,9 @@ function sanitizePlayerNickname(raw) {
 
 function validateAuthPasswordPolicy(password) {
     const pass = String(password || '');
+    if (/[^\x21-\x7E]/.test(pass)) {
+        return { ok: false, message: 'Password must use English letters, numbers, and symbols only.' };
+    }
     if (!/[A-Z]/.test(pass)) {
         return { ok: false, message: 'Password must include at least one uppercase letter.' };
     }
@@ -761,6 +765,18 @@ function sendAuthError(res, status, code, message, extra = {}) {
         message,
         ...extra
     });
+}
+
+function ensurePersistentAuthStore(res) {
+    if (!AUTH_REQUIRE_PERSISTENT_STORE) return true;
+    if (identityStore && identityStore.mode === 'postgres') return true;
+    sendAuthError(
+        res,
+        503,
+        'AUTH_PERSISTENCE_NOT_CONFIGURED',
+        'Persistent account storage is not configured. Set DATABASE_URL to a PostgreSQL instance.'
+    );
+    return false;
 }
 
 function mapIdentityError(res, err) {
@@ -3666,6 +3682,7 @@ setInterval(() => {
 // ==================== AUTH HTTP API ====================
 app.post('/auth/signup-link', async (req, res) => {
     try {
+        if (!ensurePersistentAuthStore(res)) return;
         const body = req.body || {};
         const emailInput = String(body.email || '').trim();
         const usernameInput = String(body.username || '').trim();
@@ -3676,7 +3693,7 @@ app.post('/auth/signup-link', async (req, res) => {
             return;
         }
         if (!AUTH_USERNAME_RE.test(usernameInput)) {
-            sendAuthError(res, 400, 'INVALID_USERNAME', 'Username must be 3-24 chars (letters, numbers, underscore).');
+            sendAuthError(res, 400, 'INVALID_USERNAME', 'Username must be 3-24 English letters, numbers, or underscore.');
             return;
         }
         if (password.length < AUTH_PASSWORD_MIN_LEN || password.length > AUTH_PASSWORD_MAX_LEN) {
@@ -3752,6 +3769,7 @@ app.post('/auth/signup-link', async (req, res) => {
 
 app.post('/auth/resend-verification', async (req, res) => {
     try {
+        if (!ensurePersistentAuthStore(res)) return;
         const body = req.body || {};
         const emailInput = String(body.email || '').trim();
         const emailNorm = normalizeAuthEmail(emailInput);
@@ -3800,6 +3818,7 @@ app.post('/auth/resend-verification', async (req, res) => {
 
 app.post('/auth/verify-email', async (req, res) => {
     try {
+        if (!ensurePersistentAuthStore(res)) return;
         const body = req.body || {};
         const emailInput = String(body.email || '').trim();
         const otp = String(body.otp || '').trim();
@@ -3849,6 +3868,7 @@ app.post('/auth/verify-email', async (req, res) => {
 
 app.post('/auth/signin', async (req, res) => {
     try {
+        if (!ensurePersistentAuthStore(res)) return;
         const body = req.body || {};
         const login = String(body.email_or_username || '').trim();
         const password = typeof body.password === 'string' ? body.password : '';
