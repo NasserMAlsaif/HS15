@@ -133,6 +133,7 @@ const HARD_BLOCK_MS = envInt('ANTI_CHEAT_HARD_BLOCK_MS', 8000, 500, 600000);
 const BLOCK_LOG_COOLDOWN_MS = 1200;
 const ACTIVE_MATCH_STATES = new Set(['playing', 'starting', 'countdown']);
 const PARTY_INVITE_TTL_MS = envInt('PARTY_INVITE_TTL_MS', 45000, 5000, 10 * 60 * 1000);
+const INSTANT_RESPAWN_MATCH_CHARGES = 3;
 
 const KILLSTREAK_TIERS = {
     EXTRA_CORE: 3,
@@ -310,6 +311,7 @@ const antiCheatMetrics = {
     escalations: []
 };
 const reconnectGuard = {}; // persistentId -> { start, count }
+const adRewardStateByPersistent = {}; // persistentId -> { instantRespawnPending, updatedAt }
 const handshakeGuards = {
     connectionByIp: {},
     registerByIp: {},
@@ -318,6 +320,70 @@ const handshakeGuards = {
     joinByIp: {},
     joinByPid: {}
 };
+
+function sanitizePersistentId(value) {
+    if (typeof value !== 'string') return '';
+    return value.trim();
+}
+
+function getAdRewardState(persistentId) {
+    const pid = sanitizePersistentId(persistentId);
+    if (!pid) return null;
+    if (!adRewardStateByPersistent[pid]) {
+        adRewardStateByPersistent[pid] = {
+            instantRespawnPending: false,
+            updatedAt: Date.now()
+        };
+    }
+    return adRewardStateByPersistent[pid];
+}
+
+function setAdInstantRespawnPending(persistentId, nextPending) {
+    const state = getAdRewardState(persistentId);
+    if (!state) return null;
+    state.instantRespawnPending = !!nextPending;
+    state.updatedAt = Date.now();
+    return state;
+}
+
+function buildAdsStatePayload(persistentId) {
+    const state = getAdRewardState(persistentId);
+    return {
+        instantRespawnPending: !!(state && state.instantRespawnPending)
+    };
+}
+
+function emitAdsStateToSocket(targetSocket) {
+    if (!targetSocket || !targetSocket.authPersistentId) return;
+    targetSocket.emit('ads:state', buildAdsStatePayload(targetSocket.authPersistentId));
+}
+
+function emitAdsStateToPersistent(persistentId) {
+    const pid = sanitizePersistentId(persistentId);
+    if (!pid) return;
+    const payload = buildAdsStatePayload(pid);
+    Array.from(io.sockets.sockets.values()).forEach((s) => {
+        if (!s || s.authPersistentId !== pid) return;
+        s.emit('ads:state', payload);
+    });
+}
+
+function finalizeRoomAdRewards(room) {
+    if (!room || !room.players) return;
+    const touched = new Set();
+    Object.values(room.players).forEach((player) => {
+        if (!player || !player.persistentId) return;
+        const pid = player.persistentId;
+        if (player.instantRespawnActiveAtMatchStart) {
+            setAdInstantRespawnPending(pid, !player.instantRespawnUsedThisMatch);
+        }
+        player.instantRespawnActiveAtMatchStart = false;
+        player.instantRespawnUsedThisMatch = false;
+        player.instantRespawnCharges = 0;
+        touched.add(pid);
+    });
+    touched.forEach((pid) => emitAdsStateToPersistent(pid));
+}
 
 function ensureDataDir() {
     try {
@@ -1109,6 +1175,9 @@ function resetRoomForLobby(roomCode) {
             seq: 0
         };
         p.inputIntegrity = { lastMask: 0, lastAt: 0, togglePoints: 0, windowStart: 0 };
+        p.instantRespawnCharges = 0;
+        p.instantRespawnUsedThisMatch = false;
+        p.instantRespawnActiveAtMatchStart = false;
     });
 }
 
@@ -1249,6 +1318,8 @@ function startGame(roomCode) {
     // Position players at spawn points
     playerList.forEach(player => {
         const spawn = getNextSpawn(roomCode);
+        const rewardState = getAdRewardState(player.persistentId);
+        const hadInstantRespawn = !!(rewardState && rewardState.instantRespawnPending);
         player.x = spawn.x;
         player.y = spawn.y;
         player.hp = 3;
@@ -1256,6 +1327,15 @@ function startGame(roomCode) {
         player.kills = 0;
         player.deaths = 0;
         player.killstreak = 0;
+        player.instantRespawnActiveAtMatchStart = hadInstantRespawn;
+        player.instantRespawnUsedThisMatch = false;
+        player.instantRespawnCharges = hadInstantRespawn ? INSTANT_RESPAWN_MATCH_CHARGES : 0;
+        if (hadInstantRespawn && player.persistentId) {
+            setAdInstantRespawnPending(player.persistentId, false);
+        }
+    });
+    playerList.forEach((player) => {
+        if (player && player.persistentId) emitAdsStateToPersistent(player.persistentId);
     });
     
     // Broadcast countdown start
@@ -1524,21 +1604,32 @@ function handleKill(roomCode, killerId, victimId, isHeadshot) {
     } else if (killer.killstreak === KILLSTREAK_TIERS.LEGENDARY) {
         killstreakTier = 'legendary';
     }
+
+    let usedInstantRespawn = false;
+    let remainingInstantRespawnCharges = 0;
+    if (victim.instantRespawnCharges > 0) {
+        victim.instantRespawnCharges = Math.max(0, victim.instantRespawnCharges - 1);
+        victim.instantRespawnUsedThisMatch = true;
+        usedInstantRespawn = true;
+        remainingInstantRespawnCharges = victim.instantRespawnCharges;
+    }
     
     // Schedule respawn
-    setTimeout(() => {
-        const roomNow = rooms[roomCode];
-        if (!roomNow) return;
+    if (!usedInstantRespawn) {
+        setTimeout(() => {
+            const roomNow = rooms[roomCode];
+            if (!roomNow) return;
 
-        let victimRef = roomNow.players[victimId];
-        if (!victimRef && victim.persistentId) {
-            const entry = Object.entries(roomNow.players || {}).find(([, p]) => p && p.persistentId === victim.persistentId);
-            if (entry) victimRef = entry[1];
-        }
-        if (!victimRef) return;
+            let victimRef = roomNow.players[victimId];
+            if (!victimRef && victim.persistentId) {
+                const entry = Object.entries(roomNow.players || {}).find(([, p]) => p && p.persistentId === victim.persistentId);
+                if (entry) victimRef = entry[1];
+            }
+            if (!victimRef) return;
 
-        respawnRoomPlayer(roomCode, victimRef);
-    }, PLAYER_RESPAWN_DELAY);
+            respawnRoomPlayer(roomCode, victimRef);
+        }, PLAYER_RESPAWN_DELAY);
+    }
     
     // Broadcast kill
     io.to(roomCode).emit('playerKilled', {
@@ -1550,6 +1641,14 @@ function handleKill(roomCode, killerId, victimId, isHeadshot) {
         chainCount: chain.count,
         killstreakTier: killstreakTier
     });
+
+    if (usedInstantRespawn) {
+        respawnRoomPlayer(roomCode, victim);
+        io.to(roomCode).emit('instantRespawnUsed', {
+            playerId: victim.id,
+            remainingCharges: remainingInstantRespawnCharges
+        });
+    }
 }
 
 function updateBuffs(roomCode) {
@@ -1654,6 +1753,9 @@ function makePlayer(socketId, playerName, persistentId, isLeader, profileMeta = 
         },
         input: { w: false, a: false, s: false, d: false, angle: 0, charging: false, seq: 0 },
         inputIntegrity: { lastMask: 0, lastAt: 0, togglePoints: 0, windowStart: 0 },
+        instantRespawnCharges: 0,
+        instantRespawnUsedThisMatch: false,
+        instantRespawnActiveAtMatchStart: false,
         lastUpdate: Date.now()
     };
 }
@@ -2431,6 +2533,7 @@ io.on('connection', (socket) => {
         );
 
         await emitFriendsStateToSocket(socket);
+        emitAdsStateToSocket(socket);
 
         // If this device has a finished match pending, show results after reconnect.
         emitPendingMatchResultsForSocket(socket) || emitRecentRoomResultsForSocket(socket);
@@ -3010,6 +3113,72 @@ io.on('connection', (socket) => {
         };
         socket.emit('clientPong', payload);
         socket.emit('serverPong', payload);
+    });
+
+    socket.on('ads:rewardedCompleted', (data, ack) => {
+        if (!allowEvent('ads:rewardedCompleted', 8, 60000)) {
+            if (typeof ack === 'function') {
+                ack({ ok: false, error: 'RATE_LIMITED', message: 'Too many rewarded requests. Please wait.' });
+            }
+            return;
+        }
+        if (!socket.authPersistentId) {
+            if (typeof ack === 'function') {
+                ack({ ok: false, error: 'AUTH_REQUIRED', message: 'Please reconnect and try again.' });
+            }
+            return;
+        }
+        const rewardType = data && typeof data.type === 'string' ? data.type.trim() : '';
+        if (rewardType !== 'instant_respawn') {
+            if (typeof ack === 'function') {
+                ack({ ok: false, error: 'INVALID_REWARD_TYPE', message: 'Unsupported reward type.' });
+            }
+            return;
+        }
+
+        const activeMatch = findActiveMatchForPersistentId(socket.authPersistentId);
+        if (activeMatch) {
+            if (typeof ack === 'function') {
+                ack({ ok: false, error: 'IN_MATCH', message: 'Rewarded ad cannot be claimed during a match.' });
+            }
+            return;
+        }
+
+        if (socket.roomCode && rooms[socket.roomCode]) {
+            const room = rooms[socket.roomCode];
+            if (room.state === 'lobby') {
+                ensureSocketPlayerBinding(room);
+                const me = getPlayer(room);
+                if (me) {
+                    const isLeader = room.leader === (socket.playerKey || socket.id);
+                    if (isLeader || me.ready) {
+                        if (typeof ack === 'function') {
+                            ack({
+                                ok: false,
+                                error: 'NOT_ALLOWED_WHILE_READY',
+                                message: 'Set Not Ready before watching rewarded ads.'
+                            });
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+
+        const state = getAdRewardState(socket.authPersistentId);
+        if (state && state.instantRespawnPending) {
+            if (typeof ack === 'function') {
+                ack({ ok: true, instantRespawnPending: true, alreadyActive: true });
+            }
+            emitAdsStateToPersistent(socket.authPersistentId);
+            return;
+        }
+
+        setAdInstantRespawnPending(socket.authPersistentId, true);
+        if (typeof ack === 'function') {
+            ack({ ok: true, instantRespawnPending: true });
+        }
+        emitAdsStateToPersistent(socket.authPersistentId);
     });
     
     // Create room
@@ -3663,6 +3832,7 @@ setInterval(() => {
                 storePendingMatchResults(roomCode, resultPlayers);
                 room.lastMatchResults = resultPlayers;
                 room.lastMatchEndedAt = endedAt;
+                finalizeRoomAdRewards(room);
                 resetRoomForLobby(roomCode);
                 io.to(roomCode).emit('gameEnd', {
                     roomCode: roomCode,
