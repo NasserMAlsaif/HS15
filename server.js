@@ -282,6 +282,12 @@ const BUFF_TYPES = ['health', 'shield', 'invis', 'speed'];
 // ==================== ROOM MANAGEMENT ====================
 const rooms = {};
 const identityStore = createIdentityStore();
+if (identityStore && identityStore.mode) {
+    console.log(`[identity] store mode: ${identityStore.mode}`);
+    if (identityStore.mode === 'memory') {
+        console.warn('[identity] DATABASE_URL is not set. Accounts/friends are in memory and will reset on restart/redeploy.');
+    }
+}
 const sessions = {}; // persistentId -> { token, name, exp, profileId, friendCode, username, isGuest }
 const pendingMatchResults = {}; // persistentId -> { roomCode, players, endedAt, exp }
 const partyInvitesById = {}; // inviteId -> { id, roomCode, fromProfileId, fromName, toProfileId, status, createdAt, expiresAt, respondedAt }
