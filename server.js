@@ -9,6 +9,7 @@ const path = require('path');
 const crypto = require('crypto');
 const fs = require('fs');
 const nodemailer = require('nodemailer');
+const { Encoder: SocketIoPacketEncoder } = require('socket.io-parser');
 const { createIdentityStore } = require('./identity-store');
 
 const app = express();
@@ -134,6 +135,8 @@ const BLOCK_LOG_COOLDOWN_MS = 1200;
 const ACTIVE_MATCH_STATES = new Set(['playing', 'starting', 'countdown']);
 const PARTY_INVITE_TTL_MS = envInt('PARTY_INVITE_TTL_MS', 45000, 5000, 10 * 60 * 1000);
 const INSTANT_RESPAWN_MATCH_CHARGES = 3;
+const NET_MONITOR_ENABLED = envBool('NET_MONITOR_ENABLED', IS_DEV_MODE);
+const NET_MONITOR_LOG_INTERVAL_MS = envInt('NET_MONITOR_LOG_INTERVAL_MS', 5000, 1000, 60000);
 
 const KILLSTREAK_TIERS = {
     EXTRA_CORE: 3,
@@ -320,6 +323,358 @@ const handshakeGuards = {
     joinByIp: {},
     joinByPid: {}
 };
+const socketIoPacketEncoder = new SocketIoPacketEncoder();
+const NET_MONITOR_IGNORED_EVENTS = new Set([
+    'heartbeat',
+    'pong',
+    'clientPing',
+    'clientPong',
+    'serverPong'
+]);
+const netMonitor = {
+    rooms: {}
+};
+
+function createNetDirectionStats() {
+    return {
+        messages: 0,
+        bytes: 0,
+        categories: {
+            playerInputs: { messages: 0, bytes: 0 },
+            worldState: { messages: 0, bytes: 0 },
+            events: { messages: 0, bytes: 0 }
+        },
+        events: {}
+    };
+}
+
+function createNetTrafficStats() {
+    return {
+        in: createNetDirectionStats(),
+        out: createNetDirectionStats()
+    };
+}
+
+function classifyNetEventCategory(eventName) {
+    if (eventName === 'playerInput') return 'playerInputs';
+    if (eventName === 'stateUpdate') return 'worldState';
+    return 'events';
+}
+
+function shouldTrackNetEvent(eventName) {
+    if (!NET_MONITOR_ENABLED) return false;
+    if (typeof eventName !== 'string' || !eventName) return false;
+    return !NET_MONITOR_IGNORED_EVENTS.has(eventName);
+}
+
+function safeByteLength(value) {
+    if (value === null || value === undefined) return 0;
+    if (typeof value === 'string') return Buffer.byteLength(value);
+    if (Buffer.isBuffer(value)) return value.length;
+    if (value instanceof ArrayBuffer) return value.byteLength;
+    if (ArrayBuffer.isView(value)) return value.byteLength;
+    try {
+        return Buffer.byteLength(String(value));
+    } catch (_) {
+        return 0;
+    }
+}
+
+function normalizeEventArgs(args) {
+    if (!Array.isArray(args)) return [];
+    return args.filter((arg) => typeof arg !== 'function');
+}
+
+function estimateSocketIoPacketBytes(packet) {
+    if (!packet) return 0;
+    try {
+        const encoded = socketIoPacketEncoder.encode(packet);
+        let bytes = 0;
+        for (const part of encoded) bytes += safeByteLength(part);
+        // Engine.IO "message" envelope prefix.
+        if (encoded.length > 0) bytes += 1;
+        return bytes;
+    } catch (_) {
+        try {
+            return Buffer.byteLength(JSON.stringify(packet.data || packet));
+        } catch (_) {
+            return 0;
+        }
+    }
+}
+
+function estimateSocketIoEventBytes(eventName, args) {
+    const payload = [eventName].concat(normalizeEventArgs(args));
+    return estimateSocketIoPacketBytes({ type: 2, nsp: '/', data: payload });
+}
+
+function formatBytes(value) {
+    const bytes = Math.max(0, Number(value) || 0);
+    if (bytes < 1024) return `${bytes.toFixed(0)} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(2)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+function formatRate(bytesPerSec) {
+    return `${formatBytes(bytesPerSec)}/s`;
+}
+
+function ensureRoomNetMonitor(roomCode) {
+    if (!NET_MONITOR_ENABLED) return null;
+    if (!roomCode || !rooms[roomCode]) return null;
+    if (!netMonitor.rooms[roomCode]) {
+        netMonitor.rooms[roomCode] = {
+            roomCode,
+            matchIndex: 0,
+            matchActive: false,
+            matchStartedAt: 0,
+            sampleStartedAt: 0,
+            sample: createNetTrafficStats(),
+            totals: createNetTrafficStats(),
+            lastSummary: null
+        };
+    }
+    return netMonitor.rooms[roomCode];
+}
+
+function appendTraffic(stats, direction, eventName, messageCount, byteCount) {
+    const dir = stats[direction];
+    if (!dir) return;
+    const category = classifyNetEventCategory(eventName);
+    const msgs = Math.max(0, Number(messageCount) || 0);
+    const bytes = Math.max(0, Number(byteCount) || 0);
+    dir.messages += msgs;
+    dir.bytes += bytes;
+    dir.categories[category].messages += msgs;
+    dir.categories[category].bytes += bytes;
+    if (!dir.events[eventName]) dir.events[eventName] = { messages: 0, bytes: 0 };
+    dir.events[eventName].messages += msgs;
+    dir.events[eventName].bytes += bytes;
+}
+
+function beginRoomNetworkMatch(roomCode) {
+    const monitor = ensureRoomNetMonitor(roomCode);
+    if (!monitor) return;
+    if (monitor.matchActive) {
+        finishRoomNetworkMatch(roomCode, 'restarted');
+    }
+    const now = Date.now();
+    monitor.matchIndex += 1;
+    monitor.matchActive = true;
+    monitor.matchStartedAt = now;
+    monitor.sampleStartedAt = now;
+    monitor.sample = createNetTrafficStats();
+    monitor.totals = createNetTrafficStats();
+    monitor.lastSummary = null;
+    console.log(`[net][room ${roomCode}] monitor started for match #${monitor.matchIndex}`);
+}
+
+function recordRoomNetworkEvent(roomCode, direction, eventName, bytesPerMessage, recipients = 1) {
+    if (!shouldTrackNetEvent(eventName)) return;
+    const monitor = ensureRoomNetMonitor(roomCode);
+    if (!monitor || !monitor.matchActive) return;
+    const perMessageBytes = Math.max(0, Math.floor(Number(bytesPerMessage) || 0));
+    const messageCount = Math.max(1, Math.floor(Number(recipients) || 1));
+    const totalBytes = perMessageBytes * messageCount;
+    appendTraffic(monitor.sample, direction, eventName, messageCount, totalBytes);
+    appendTraffic(monitor.totals, direction, eventName, messageCount, totalBytes);
+}
+
+function summarizeDirectionStats(dirStats, durationSec) {
+    const sec = Math.max(0.001, durationSec);
+    const msgPerSec = dirStats.messages / sec;
+    const bytesPerSec = dirStats.bytes / sec;
+    const avgMsgBytes = dirStats.messages > 0 ? (dirStats.bytes / dirStats.messages) : 0;
+    return { msgPerSec, bytesPerSec, avgMsgBytes };
+}
+
+function summarizeCategoryStats(dirStats, category, durationSec) {
+    const cat = dirStats.categories[category];
+    const sec = Math.max(0.001, durationSec);
+    const msgPerSec = cat.messages / sec;
+    const bytesPerSec = cat.bytes / sec;
+    const avgMsgBytes = cat.messages > 0 ? (cat.bytes / cat.messages) : 0;
+    return { msgPerSec, bytesPerSec, avgMsgBytes };
+}
+
+function topEventsLine(eventsMap, durationSec, limit = 5) {
+    const sec = Math.max(0.001, Number(durationSec) || 0.001);
+    const top = Object.entries(eventsMap || {})
+        .sort((a, b) => b[1].bytes - a[1].bytes)
+        .slice(0, Math.max(1, limit))
+        .map(([name, val]) => {
+            const messages = val.messages || 0;
+            const bytes = val.bytes || 0;
+            const mps = messages / sec;
+            const avg = messages > 0 ? (bytes / messages) : 0;
+            return `${name}:${formatBytes(bytes)}(${messages} msgs, ${mps.toFixed(2)}/s, avg ${avg.toFixed(1)} B)`;
+        });
+    return top.length ? top.join(' | ') : 'none';
+}
+
+function logRoomNetworkSample(roomCode, force = false) {
+    const monitor = netMonitor.rooms[roomCode];
+    if (!NET_MONITOR_ENABLED || !monitor || !monitor.matchActive) return;
+    const now = Date.now();
+    const elapsedMs = Math.max(1, now - monitor.sampleStartedAt);
+    if (!force && elapsedMs < NET_MONITOR_LOG_INTERVAL_MS) return;
+    const elapsedSec = elapsedMs / 1000;
+    const inSummary = summarizeDirectionStats(monitor.sample.in, elapsedSec);
+    const outSummary = summarizeDirectionStats(monitor.sample.out, elapsedSec);
+    const inInput = summarizeCategoryStats(monitor.sample.in, 'playerInputs', elapsedSec);
+    const outState = summarizeCategoryStats(monitor.sample.out, 'worldState', elapsedSec);
+    const inEvents = summarizeCategoryStats(monitor.sample.in, 'events', elapsedSec);
+    const outEvents = summarizeCategoryStats(monitor.sample.out, 'events', elapsedSec);
+
+    console.log(
+        `[net][room ${roomCode}] sample ${elapsedSec.toFixed(1)}s | ` +
+        `IN ${formatRate(inSummary.bytesPerSec)} (${inSummary.msgPerSec.toFixed(1)} msg/s avg ${inSummary.avgMsgBytes.toFixed(1)} B) | ` +
+        `OUT ${formatRate(outSummary.bytesPerSec)} (${outSummary.msgPerSec.toFixed(1)} msg/s avg ${outSummary.avgMsgBytes.toFixed(1)} B)`
+    );
+    console.log(
+        `[net][room ${roomCode}] playerInput IN ${formatRate(inInput.bytesPerSec)} (${inInput.msgPerSec.toFixed(1)} msg/s avg ${inInput.avgMsgBytes.toFixed(1)} B) | ` +
+        `stateUpdate OUT ${formatRate(outState.bytesPerSec)} (${outState.msgPerSec.toFixed(1)} msg/s avg ${outState.avgMsgBytes.toFixed(1)} B)`
+    );
+    console.log(
+        `[net][room ${roomCode}] events IN ${formatRate(inEvents.bytesPerSec)} (${inEvents.msgPerSec.toFixed(1)} msg/s) | ` +
+        `events OUT ${formatRate(outEvents.bytesPerSec)} (${outEvents.msgPerSec.toFixed(1)} msg/s)`
+    );
+    console.log(`[net][room ${roomCode}] top IN events: ${topEventsLine(monitor.sample.in.events, elapsedSec)}`);
+    console.log(`[net][room ${roomCode}] top OUT events: ${topEventsLine(monitor.sample.out.events, elapsedSec)}`);
+
+    monitor.sample = createNetTrafficStats();
+    monitor.sampleStartedAt = now;
+}
+
+function finishRoomNetworkMatch(roomCode, reason = 'ended') {
+    const monitor = netMonitor.rooms[roomCode];
+    if (!NET_MONITOR_ENABLED || !monitor || !monitor.matchActive) return;
+    logRoomNetworkSample(roomCode, true);
+
+    const room = rooms[roomCode];
+    const playersCount = room && room.players ? Math.max(1, Object.keys(room.players).length) : 1;
+    const durationSec = Math.max(0.001, (Date.now() - monitor.matchStartedAt) / 1000);
+    const inTotals = monitor.totals.in;
+    const outTotals = monitor.totals.out;
+    const totalBytes = inTotals.bytes + outTotals.bytes;
+    const downlinkPerPlayerPerSec = outTotals.bytes / durationSec / playersCount;
+    const matchBytesPerSec = totalBytes / durationSec;
+
+    console.log(
+        `[net][room ${roomCode}] match summary (${reason}) duration=${durationSec.toFixed(1)}s players=${playersCount} ` +
+        `IN=${formatBytes(inTotals.bytes)} OUT=${formatBytes(outTotals.bytes)} TOTAL=${formatBytes(totalBytes)}`
+    );
+    console.log(
+        `[net][room ${roomCode}] per-player downlink=${formatRate(downlinkPerPlayerPerSec)} | ` +
+        `whole-match throughput=${formatRate(matchBytesPerSec)}`
+    );
+    console.log(
+        `[net][room ${roomCode}] playerInput IN total=${formatBytes(inTotals.categories.playerInputs.bytes)} ` +
+        `(${inTotals.categories.playerInputs.messages} msgs)`
+    );
+    console.log(
+        `[net][room ${roomCode}] stateUpdate OUT total=${formatBytes(outTotals.categories.worldState.bytes)} ` +
+        `(${outTotals.categories.worldState.messages} msgs)`
+    );
+    console.log(
+        `[net][room ${roomCode}] events IN total=${formatBytes(inTotals.categories.events.bytes)} ` +
+        `(${inTotals.categories.events.messages} msgs) | events OUT total=${formatBytes(outTotals.categories.events.bytes)} ` +
+        `(${outTotals.categories.events.messages} msgs)`
+    );
+    console.log(`[net][room ${roomCode}] top IN events (match): ${topEventsLine(inTotals.events, durationSec, 8)}`);
+    console.log(`[net][room ${roomCode}] top OUT events (match): ${topEventsLine(outTotals.events, durationSec, 8)}`);
+
+    monitor.lastSummary = {
+        reason,
+        endedAt: Date.now(),
+        durationSec,
+        playersCount,
+        inBytes: inTotals.bytes,
+        outBytes: outTotals.bytes,
+        totalBytes,
+        downlinkPerPlayerPerSec,
+        matchBytesPerSec
+    };
+    monitor.matchActive = false;
+}
+
+function resolveBroadcastRecipients(adapter, opts) {
+    const recipients = new Set();
+    const targetRooms = opts && opts.rooms instanceof Set ? opts.rooms : null;
+    if (targetRooms && targetRooms.size > 0) {
+        targetRooms.forEach((roomName) => {
+            const members = adapter.rooms.get(roomName);
+            if (!members) return;
+            members.forEach((sid) => recipients.add(sid));
+        });
+    } else {
+        adapter.sids.forEach((_, sid) => recipients.add(sid));
+    }
+
+    const exceptRooms = opts && opts.except instanceof Set ? opts.except : null;
+    if (exceptRooms && exceptRooms.size > 0) {
+        exceptRooms.forEach((roomName) => {
+            const members = adapter.rooms.get(roomName);
+            if (!members) return;
+            members.forEach((sid) => recipients.delete(sid));
+        });
+    }
+    return recipients;
+}
+
+function groupRecipientsByRoom(recipients) {
+    const grouped = {};
+    recipients.forEach((sid) => {
+        const targetSocket = io.sockets.sockets.get(sid);
+        if (!targetSocket || !targetSocket.roomCode || !rooms[targetSocket.roomCode]) return;
+        grouped[targetSocket.roomCode] = (grouped[targetSocket.roomCode] || 0) + 1;
+    });
+    return grouped;
+}
+
+function trackBroadcastPacket(adapter, packet, opts) {
+    if (!NET_MONITOR_ENABLED || !packet || !Array.isArray(packet.data) || packet.data.length === 0) return;
+    const eventName = typeof packet.data[0] === 'string' ? packet.data[0] : String(packet.data[0] || '');
+    if (!shouldTrackNetEvent(eventName)) return;
+
+    const recipients = resolveBroadcastRecipients(adapter, opts);
+    if (!recipients.size) return;
+
+    const bytesPerMessage = estimateSocketIoPacketBytes(packet);
+    const grouped = groupRecipientsByRoom(recipients);
+    Object.entries(grouped).forEach(([roomCode, count]) => {
+        recordRoomNetworkEvent(roomCode, 'out', eventName, bytesPerMessage, count);
+    });
+}
+
+function instrumentSocketIoBroadcastMonitor() {
+    if (!NET_MONITOR_ENABLED) return;
+    const adapter = io.of('/').adapter;
+    if (!adapter || adapter.__netMonitorWrapped) return;
+
+    const originalBroadcast = adapter.broadcast.bind(adapter);
+    adapter.broadcast = function wrappedBroadcast(packet, opts) {
+        try {
+            trackBroadcastPacket(adapter, packet, opts || {});
+        } catch (_) {}
+        return originalBroadcast(packet, opts);
+    };
+
+    if (typeof adapter.broadcastWithAck === 'function') {
+        const originalBroadcastWithAck = adapter.broadcastWithAck.bind(adapter);
+        adapter.broadcastWithAck = function wrappedBroadcastWithAck(packet, opts, clientCountCallback, ack) {
+            try {
+                trackBroadcastPacket(adapter, packet, opts || {});
+            } catch (_) {}
+            return originalBroadcastWithAck(packet, opts, clientCountCallback, ack);
+        };
+    }
+
+    adapter.__netMonitorWrapped = true;
+    console.log(`[net] monitor enabled (sample interval: ${NET_MONITOR_LOG_INTERVAL_MS}ms)`);
+}
+
+instrumentSocketIoBroadcastMonitor();
 
 function sanitizePersistentId(value) {
     if (typeof value !== 'string') return '';
@@ -1349,6 +1704,7 @@ function startGame(roomCode) {
         if (rooms[roomCode]) {
             rooms[roomCode].state = 'playing';
             rooms[roomCode].gameStartTime = Date.now();
+            beginRoomNetworkMatch(roomCode);
             io.to(roomCode).emit('gameStart', { startTime: room.gameStartTime });
         }
     }, COUNTDOWN_DURATION);
@@ -1813,6 +2169,25 @@ io.on('connection', (socket) => {
         (socket.conn && socket.conn.remoteAddress) ||
         ''
     );
+
+    if (NET_MONITOR_ENABLED) {
+        const originalSocketEmit = socket.emit.bind(socket);
+        socket.emit = function monitoredSocketEmit(eventName, ...args) {
+            const roomCode = socket.roomCode;
+            if (roomCode && rooms[roomCode] && shouldTrackNetEvent(eventName)) {
+                const bytes = estimateSocketIoEventBytes(eventName, args);
+                recordRoomNetworkEvent(roomCode, 'out', eventName, bytes, 1);
+            }
+            return originalSocketEmit(eventName, ...args);
+        };
+
+        socket.onAny((eventName, ...args) => {
+            const roomCode = socket.roomCode;
+            if (!roomCode || !rooms[roomCode] || !shouldTrackNetEvent(eventName)) return;
+            const bytes = estimateSocketIoEventBytes(eventName, args);
+            recordRoomNetworkEvent(roomCode, 'in', eventName, bytes, 1);
+        });
+    }
     
     // Heartbeat
     heartbeatInterval = setInterval(() => {
@@ -2430,8 +2805,12 @@ io.on('connection', (socket) => {
 
         const remainingPlayers = Object.values(room.players);
         if (remainingPlayers.length === 0) {
+            if (isActiveMatchState(room.state)) {
+                finishRoomNetworkMatch(roomCode, 'room_deleted_empty');
+            }
             invalidatePartyInvitesForRoom(roomCode, 'cancelled');
             delete rooms[roomCode];
+            delete netMonitor.rooms[roomCode];
             console.log(`Room ${roomCode} deleted (empty)`);
             return;
         }
@@ -3115,6 +3494,21 @@ io.on('connection', (socket) => {
         socket.emit('serverPong', payload);
     });
 
+    socket.on('ads:getState', (ack) => {
+        if (!socket.authPersistentId) {
+            if (typeof ack === 'function') {
+                ack({ ok: false, error: 'AUTH_REQUIRED', message: 'Please reconnect and try again.' });
+            }
+            return;
+        }
+        const payload = buildAdsStatePayload(socket.authPersistentId);
+        if (typeof ack === 'function') {
+            ack(Object.assign({ ok: true }, payload));
+            return;
+        }
+        socket.emit('ads:state', payload);
+    });
+
     socket.on('ads:rewardedCompleted', (data, ack) => {
         if (!allowEvent('ads:rewardedCompleted', 8, 60000)) {
             if (typeof ack === 'function') {
@@ -3437,6 +3831,7 @@ io.on('connection', (socket) => {
             if (rooms[roomCode] && rooms[roomCode].state === 'starting') {
                 rooms[roomCode].state = 'playing';
                 rooms[roomCode].gameStartTime = Date.now();
+                beginRoomNetworkMatch(roomCode);
                 
                 io.to(roomCode).emit('gameStarted', {
                     startTime: rooms[roomCode].gameStartTime
@@ -3839,11 +4234,20 @@ setInterval(() => {
                     players: resultPlayers,
                     endedAt
                 });
+                finishRoomNetworkMatch(roomCode, 'timer_elapsed');
                 emitLobbyUpdate(roomCode);
             }
         }
     });
 }, TICK_MS); // authoritative simulation tick rate
+
+if (NET_MONITOR_ENABLED) {
+    setInterval(() => {
+        Object.keys(netMonitor.rooms).forEach((roomCode) => {
+            logRoomNetworkSample(roomCode);
+        });
+    }, NET_MONITOR_LOG_INTERVAL_MS);
+}
 
 setInterval(() => {
     cleanupExpiredPartyInvites();
