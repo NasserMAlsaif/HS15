@@ -54,8 +54,9 @@ const ANTI_CHEAT_SNAPSHOTS_FILE = path.join(DATA_DIR, 'anti-cheat-room-snapshots
 // ==================== GAME CONSTANTS ====================
 const MAP_WIDTH = 3000;
 const MAP_HEIGHT = 2000;
-const TICK_RATE = envInt('TICK_RATE', 45, 20, 60);
+const TICK_RATE = envInt('TICK_RATE', 30, 10, 60);
 const TICK_MS = 1000 / TICK_RATE;
+const STATE_FULL_SNAPSHOT_INTERVAL_MS = envInt('STATE_FULL_SNAPSHOT_INTERVAL_MS', 1000, 250, 5000);
 const BASE_SPEED_PER_SEC = 127.05; // 2.1175 * 60fps
 const MAX_PLAYERS_PER_ROOM = 6;
 const BOT_COUNT = 5;
@@ -1493,9 +1494,171 @@ function emitRecentRoomResultsForSocket(socket) {
     return false;
 }
 
+const PLAYER_STATE_FIELDS = [
+    'name',
+    'x',
+    'y',
+    'angle',
+    'hp',
+    'maxHp',
+    'kills',
+    'deaths',
+    'killstreak',
+    'hasShield',
+    'invisible',
+    'speedBoost',
+    'shieldExpire',
+    'invisExpire',
+    'speedExpire',
+    'charging',
+    'lastProcessedInput'
+];
+const PROJECTILE_STATE_FIELDS = ['ownerId', 'x', 'y', 'vx', 'vy', 'angle', 'color'];
+const BUFF_STATE_FIELDS = ['x', 'y', 'type', 'active', 'takenTime'];
+const STATE_FLOAT_EPSILON = {
+    x: 0.01,
+    y: 0.01,
+    vx: 0.01,
+    vy: 0.01,
+    angle: 0.001
+};
+
+function createRoomSyncState() {
+    return {
+        lastSnapshotAt: 0,
+        players: Object.create(null),
+        projectiles: Object.create(null),
+        buffs: Object.create(null)
+    };
+}
+
+function resetRoomSyncState(room) {
+    if (!room) return;
+    room.stateSync = createRoomSyncState();
+}
+
+function ensureRoomSyncState(room) {
+    if (!room) return createRoomSyncState();
+    if (!room.stateSync) {
+        room.stateSync = createRoomSyncState();
+    }
+    return room.stateSync;
+}
+
+function buildPlayerStatePacket(p) {
+    return {
+        id: p.id,
+        name: p.name,
+        x: p.x,
+        y: p.y,
+        angle: p.angle,
+        hp: p.hp,
+        maxHp: p.maxHp,
+        kills: p.kills,
+        deaths: p.deaths,
+        killstreak: p.killstreak,
+        hasShield: p.hasShield,
+        invisible: p.invisible,
+        speedBoost: p.speedBoost,
+        shieldExpire: p.shieldExpire || 0,
+        invisExpire: p.invisExpire || 0,
+        speedExpire: p.speedExpire || 0,
+        charging: p.charging,
+        lastProcessedInput: p.input ? p.input.seq : 0
+    };
+}
+
+function buildProjectileStatePacket(proj) {
+    const packet = {
+        id: proj.id,
+        ownerId: proj.ownerId,
+        x: proj.x,
+        y: proj.y,
+        vx: proj.vx,
+        vy: proj.vy,
+        angle: proj.angle
+    };
+    if (proj.color) packet.color = proj.color;
+    return packet;
+}
+
+function buildBuffStatePacket(buff) {
+    return {
+        id: buff.id,
+        x: buff.x,
+        y: buff.y,
+        type: buff.type,
+        active: !!buff.active,
+        takenTime: buff.takenTime || 0
+    };
+}
+
+function toStateMap(list) {
+    const map = Object.create(null);
+    (list || []).forEach((item) => {
+        if (!item || !item.id) return;
+        map[item.id] = item;
+    });
+    return map;
+}
+
+function stateValuesEqual(field, a, b) {
+    if (a === b) return true;
+    if (typeof a === 'number' && typeof b === 'number' && Number.isFinite(a) && Number.isFinite(b)) {
+        const eps = STATE_FLOAT_EPSILON[field];
+        if (eps !== undefined) return Math.abs(a - b) <= eps;
+    }
+    return false;
+}
+
+function diffStateMaps(currentMap, previousMap, fields) {
+    const upserts = [];
+    const removed = [];
+    const prev = previousMap || Object.create(null);
+
+    Object.keys(currentMap || {}).forEach((id) => {
+        const nextEntity = currentMap[id];
+        const prevEntity = prev[id];
+        if (!prevEntity) {
+            upserts.push(nextEntity);
+            return;
+        }
+        const patch = { id };
+        fields.forEach((field) => {
+            if (!stateValuesEqual(field, nextEntity[field], prevEntity[field])) {
+                patch[field] = nextEntity[field];
+            }
+        });
+        if (Object.keys(patch).length > 1) {
+            upserts.push(patch);
+        }
+    });
+
+    Object.keys(prev).forEach((id) => {
+        if (!currentMap[id]) removed.push(id);
+    });
+
+    return { upserts, removed };
+}
+
+function buildRoomStateSnapshot(room) {
+    const players = Object.values(room.players).map(buildPlayerStatePacket);
+    const projectiles = room.projectiles.map(buildProjectileStatePacket);
+    const buffs = room.buffs.map(buildBuffStatePacket);
+    return {
+        players,
+        projectiles,
+        buffs,
+        playersMap: toStateMap(players),
+        projectilesMap: toStateMap(projectiles),
+        buffsMap: toStateMap(buffs)
+    };
+}
+
 function resetRoomForLobby(roomCode) {
     const room = rooms[roomCode];
     if (!room) return;
+    resetRoomSyncState(room);
     room.state = 'lobby';
     room.gameStartTime = null;
     room.projectiles = [];
@@ -1560,6 +1723,7 @@ function createRoom(leaderId, leaderName, leaderPersistentId, leaderProfileMeta 
         lastMatchResults: null,
         lastMatchEndedAt: 0,
         lastMatchSeen: {},
+        stateSync: createRoomSyncState(),
         lastUpdate: Date.now()
     };
     
@@ -3781,6 +3945,7 @@ io.on('connection', (socket) => {
         room.killChains = {};
         room.buffs = [];
         room.nextSpawnIndex = 0;
+        resetRoomSyncState(room);
         initializeBuffs(roomCode);
 
         Object.values(room.players).forEach(player => {
@@ -4192,38 +4357,43 @@ setInterval(() => {
             updateProjectiles(roomCode, dt);
             updateBuffs(roomCode);
 
-            io.to(roomCode).emit('stateUpdate', {
-                serverTime: Date.now(),
-                remainingMs: Math.max(0, (GAME_DURATION * 1000) - (Date.now() - room.gameStartTime)),
-                players: Object.values(room.players).map(p => ({
-                    id: p.id,
-                    name: p.name,
-                    x: p.x,
-                    y: p.y,
-                    angle: p.angle,
-                    hp: p.hp,
-                    maxHp: p.maxHp,
-                    kills: p.kills,
-                    deaths: p.deaths,
-                    killstreak: p.killstreak,
-                    hasShield: p.hasShield,
-                    invisible: p.invisible,
-                    speedBoost: p.speedBoost,
-                    shieldExpire: p.shieldExpire || 0,
-                    invisExpire: p.invisExpire || 0,
-                    speedExpire: p.speedExpire || 0,
-                    charging: p.charging,
-                    lastProcessedInput: p.input ? p.input.seq : 0
-                })),
-                projectiles: room.projectiles,
-                buffs: room.buffs
-            });
-            
+            const now = Date.now();
+            const remainingMs = Math.max(0, (GAME_DURATION * 1000) - (now - room.gameStartTime));
+            const stateSync = ensureRoomSyncState(room);
+            const snapshot = buildRoomStateSnapshot(room);
+            const shouldSendFullSnapshot =
+                !stateSync.lastSnapshotAt ||
+                (now - stateSync.lastSnapshotAt) >= STATE_FULL_SNAPSHOT_INTERVAL_MS;
+
+            if (shouldSendFullSnapshot) {
+                io.to(roomCode).emit('stateUpdate', {
+                    mode: 'snapshot',
+                    serverTime: now,
+                    remainingMs,
+                    players: snapshot.players,
+                    projectiles: snapshot.projectiles,
+                    buffs: snapshot.buffs
+                });
+                stateSync.lastSnapshotAt = now;
+            } else {
+                io.to(roomCode).emit('stateUpdate', {
+                    mode: 'delta',
+                    serverTime: now,
+                    remainingMs,
+                    playersDelta: diffStateMaps(snapshot.playersMap, stateSync.players, PLAYER_STATE_FIELDS),
+                    projectilesDelta: diffStateMaps(snapshot.projectilesMap, stateSync.projectiles, PROJECTILE_STATE_FIELDS),
+                    buffsDelta: diffStateMaps(snapshot.buffsMap, stateSync.buffs, BUFF_STATE_FIELDS)
+                });
+            }
+            stateSync.players = snapshot.playersMap;
+            stateSync.projectiles = snapshot.projectilesMap;
+            stateSync.buffs = snapshot.buffsMap;
+             
             // Check game time
-            const elapsed = Date.now() - room.gameStartTime;
+            const elapsed = now - room.gameStartTime;
             if (elapsed >= GAME_DURATION * 1000) {
                 const resultPlayers = clonePlayersForResults(room);
-                const endedAt = Date.now();
+                const endedAt = now;
                 storePendingMatchResults(roomCode, resultPlayers);
                 room.lastMatchResults = resultPlayers;
                 room.lastMatchEndedAt = endedAt;
